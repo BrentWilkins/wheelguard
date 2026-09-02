@@ -1,0 +1,2 @@
+# Repository clients use this token as either a Bearer token or Basic password.
+WHEELGUARD_AUTH_TOKEN=replace-with-a-long-random-value

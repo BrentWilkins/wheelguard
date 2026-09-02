@@ -1,0 +1,54 @@
+[project]
+name = "wheelguard"
+version = "0.1.0"
+description = "A policy-aware, outage-resistant Python package index proxy"
+readme = "README.md"
+authors = [
+    { name = "Brent Wilkins", email = "218822+BrentWilkins@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "packaging>=26.3",
+    "uvicorn>=0.52.4",
+]
+
+[project.scripts]
+wheelguard = "wheelguard.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "bandit>=1.9.4",
+    "mypy>=2.3.1",
+    "pip-audit>=2.10.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.5",
+    "workers-py>=1.17.1",
+    "workers-runtime-sdk>=1.8.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = ["src/js-stubs"]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+
+[tool.mypy]
+strict = true
+packages = ["wheelguard"]

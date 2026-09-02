@@ -1,0 +1,17 @@
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.dev.vars.example
+!.env.example
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.wrangler/
+.serena/
+src/js-stubs/
+python_modules/
+pylock.toml
+__pycache__/
+*.py[cod]

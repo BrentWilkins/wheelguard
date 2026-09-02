@@ -1,0 +1,61 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "wheelguard",
+	"main": "src/worker.py",
+  "compatibility_date": "2026-09-02",
+	"compatibility_flags": [
+		"python_workers"
+	],
+  "workers_dev": true,
+  "triggers": {
+    "crons": [
+      "0 * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.1
+    }
+  },
+	"d1_databases": [
+		{
+			"binding": "WHEELGUARD_DB",
+			"database_name": "wheelguard",
+			"database_id": "c8c08f96-91a8-402e-a9f0-e2c0f8aa193e",
+			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [
+    {
+      "binding": "WHEELGUARD_ARTIFACTS",
+      "bucket_name": "wheelguard-artifacts"
+    }
+	],
+  "vars": {
+    "WHEELGUARD_UPSTREAM_URL": "https://pypi.org/simple/",
+    "WHEELGUARD_MINIMUM_AGE_DAYS": "14",
+    "WHEELGUARD_METADATA_TTL_SECONDS": "300",
+    "WHEELGUARD_MAXIMUM_METADATA_BYTES": "1,900,000",
+    "WHEELGUARD_MAXIMUM_ARTIFACT_BYTES": "104,857,600",
+    "WHEELGUARD_ALLOWED_ARTIFACT_HOSTS": "files.pythonhosted.org",
+    "WHEELGUARD_REQUIRE_AUTHENTICATION": "true",
+    "WHEELGUARD_OSV_ENABLED": "true",
+    "WHEELGUARD_OSV_URL": "https://api.osv.dev/v1/querybatch",
+    "WHEELGUARD_ADVISORY_TTL_SECONDS": "3,600",
+    "WHEELGUARD_ADVISORY_ACTIVE_DAYS": "30"
+  },
+	"access": {
+		"dev": {
+			"aud": "wheelguard-local-admin",
+			"identity": {
+				"email": "admin@example.com"
+			}
+		}
+	}
+}

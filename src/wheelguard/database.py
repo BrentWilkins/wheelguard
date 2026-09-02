@@ -1,0 +1,277 @@
+"""Persist project metadata and artifact records in SQLite."""
+
+import json
+import sqlite3
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from wheelguard.models import ArtifactRecord, ProjectResponse, SimplePayload
+
+
+@dataclass(frozen=True, slots=True)
+class CachedProject:
+    """Pair a cached project response with its retrieval timestamp."""
+
+    response: ProjectResponse
+    fetched_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CachedAdvisories:
+    """Pair version advisory identifiers with their check timestamp."""
+
+    advisories: dict[str, list[str]]
+    checked_at: datetime
+
+
+class Database:
+    """Provide the persistent Wheelguard metadata catalog."""
+
+    def __init__(self, path: Path) -> None:
+        """Initialize a database located at ``path``."""
+        self._path = path
+
+    async def initialize(self) -> None:
+        """Create the database directory and schema when absent."""
+        self._initialize()
+
+    def _initialize(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._path) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    normalized_name TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    last_serial TEXT,
+                    fetched_at REAL NOT NULL
+                );
+            CREATE TABLE IF NOT EXISTS artifacts (
+                sha256 TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                size INTEGER,
+                PRIMARY KEY (sha256, filename)
+            );
+
+            CREATE TABLE IF NOT EXISTS advisory_scans (
+                project TEXT NOT NULL,
+                versions_key TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                checked_at REAL NOT NULL,
+                PRIMARY KEY (project, versions_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS advisory_targets (
+                project TEXT PRIMARY KEY,
+                requested_at REAL NOT NULL
+            );
+            """
+            )
+
+    async def get_project(self, normalized_name: str) -> CachedProject | None:
+        """Return cached project metadata by normalized name."""
+        return self._get_project(normalized_name)
+
+    def _get_project(self, normalized_name: str) -> CachedProject | None:
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                "SELECT payload, last_serial, fetched_at FROM projects WHERE normalized_name = ?",
+                (normalized_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload: Any = json.loads(row[0])
+        if not isinstance(payload, dict):
+            return None
+        return CachedProject(
+            ProjectResponse(payload, row[1], "HIT"),
+            datetime.fromtimestamp(row[2], tz=UTC),
+        )
+
+    async def put_project(
+        self,
+        normalized_name: str,
+        response: ProjectResponse,
+        *,
+        fetched_at: datetime,
+    ) -> None:
+        """Persist project metadata and its artifact records."""
+        self._put_project(normalized_name, response, fetched_at)
+
+    def _put_project(
+        self,
+        normalized_name: str,
+        response: ProjectResponse,
+        fetched_at: datetime,
+    ) -> None:
+        encoded = json.dumps(response.payload, separators=(",", ":"), sort_keys=True)
+        records = list(_artifact_records(response.payload))
+        with sqlite3.connect(self._path) as connection:
+            connection.execute(
+                """
+                INSERT INTO projects (normalized_name, payload, last_serial, fetched_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(normalized_name) DO UPDATE SET
+                    payload = excluded.payload,
+                    last_serial = excluded.last_serial,
+                    fetched_at = excluded.fetched_at
+                """,
+                (normalized_name, encoded, response.last_serial, fetched_at.timestamp()),
+            )
+            self._write_artifacts(connection, records)
+
+    async def register_artifacts(self, payload: SimplePayload) -> None:
+        """Register artifact locations discovered in a Simple API payload."""
+        self._register_artifacts(payload)
+
+    def _register_artifacts(self, payload: SimplePayload) -> None:
+        records = list(_artifact_records(payload))
+        if not records:
+            return
+        with sqlite3.connect(self._path) as connection:
+            self._write_artifacts(connection, records)
+
+    @staticmethod
+    def _write_artifacts(connection: sqlite3.Connection, records: list[ArtifactRecord]) -> None:
+        connection.executemany(
+            """
+            INSERT INTO artifacts (sha256, filename, source_url, size)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(sha256, filename) DO UPDATE SET
+                source_url = excluded.source_url,
+                size = excluded.size
+            """,
+            [(r.sha256, r.filename, r.source_url, r.size) for r in records],
+        )
+
+    async def get_artifact(self, sha256: str, filename: str) -> ArtifactRecord | None:
+        """Look up an artifact by digest and filename."""
+        return self._get_artifact(sha256, filename)
+
+    def _get_artifact(self, sha256: str, filename: str) -> ArtifactRecord | None:
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                """
+                SELECT source_url, size FROM artifacts
+                WHERE sha256 = ? AND filename = ?
+                """,
+                (sha256, filename),
+            ).fetchone()
+        if row is None:
+            return None
+        return ArtifactRecord(sha256, filename, row[0], row[1])
+
+    async def list_projects(self) -> list[str]:
+        """List normalized names for all cached projects."""
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute("SELECT normalized_name FROM projects ORDER BY normalized_name").fetchall()
+        return [row[0] for row in rows]
+
+    async def record_advisory_target(self, project: str, *, requested_at: datetime) -> None:
+        """Record recent client interest in a project for periodic advisory refresh."""
+        with sqlite3.connect(self._path) as connection:
+            connection.execute(
+                """
+                INSERT INTO advisory_targets (project, requested_at)
+                VALUES (?, ?)
+                ON CONFLICT(project) DO UPDATE SET requested_at = excluded.requested_at
+                """,
+                (project, requested_at.timestamp()),
+            )
+
+    async def list_advisory_targets(self, *, requested_since: datetime) -> list[str]:
+        """List projects requested within the active advisory window."""
+        with sqlite3.connect(self._path) as connection:
+            rows = connection.execute(
+                """
+                SELECT project FROM advisory_targets
+                WHERE requested_at >= ?
+                ORDER BY requested_at DESC
+                """,
+                (requested_since.timestamp(),),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    async def prune_advisory_targets(self, *, requested_before: datetime) -> None:
+        """Delete advisory targets outside the active window."""
+        with sqlite3.connect(self._path) as connection:
+            connection.execute(
+                "DELETE FROM advisory_targets WHERE requested_at < ?",
+                (requested_before.timestamp(),),
+            )
+
+    async def delete_advisory_target(self, project: str) -> None:
+        """Delete an advisory target that cannot be evaluated."""
+        with sqlite3.connect(self._path) as connection:
+            connection.execute("DELETE FROM advisory_targets WHERE project = ?", (project,))
+
+    async def get_advisories(self, project: str, versions_key: str) -> CachedAdvisories | None:
+        """Return a cached advisory result for an exact version set."""
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                """
+                SELECT payload, checked_at FROM advisory_scans
+                WHERE project = ? AND versions_key = ?
+                """,
+                (project, versions_key),
+            ).fetchone()
+        if row is None:
+            return None
+        raw: Any = json.loads(row[0])
+        if not isinstance(raw, dict):
+            return None
+        advisories = {
+            version: [identifier for identifier in identifiers if isinstance(identifier, str)]
+            for version, identifiers in raw.items()
+            if isinstance(version, str) and isinstance(identifiers, list)
+        }
+        return CachedAdvisories(advisories, datetime.fromtimestamp(row[1], tz=UTC))
+
+    async def put_advisories(
+        self,
+        project: str,
+        versions_key: str,
+        advisories: dict[str, list[str]],
+        *,
+        checked_at: datetime,
+    ) -> None:
+        """Persist advisory identifiers for an exact project version set."""
+        encoded = json.dumps(advisories, separators=(",", ":"), sort_keys=True)
+        with sqlite3.connect(self._path) as connection:
+            connection.execute(
+                """
+                INSERT INTO advisory_scans (project, versions_key, payload, checked_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(project, versions_key) DO UPDATE SET
+                    payload = excluded.payload,
+                    checked_at = excluded.checked_at
+                """,
+                (project, versions_key, encoded, checked_at.timestamp()),
+            )
+
+
+def _artifact_records(payload: SimplePayload) -> Iterator[ArtifactRecord]:
+    files = payload.get("files", [])
+    if not isinstance(files, list):
+        return
+    for file in files:
+        if not isinstance(file, dict):
+            continue
+        hashes = file.get("hashes")
+        digest = hashes.get("sha256") if isinstance(hashes, dict) else None
+        filename = file.get("filename")
+        source_url = file.get("url")
+        size = file.get("size")
+        if not isinstance(digest, str) or not isinstance(filename, str) or not isinstance(source_url, str):
+            continue
+        yield ArtifactRecord(
+            digest.casefold(),
+            filename,
+            source_url,
+            size if isinstance(size, int) else None,
+        )

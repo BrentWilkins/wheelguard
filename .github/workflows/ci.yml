@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 12 * * 1" # Weekly on Monday at 12:00 UTC.
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --dev
+
+      - name: Check formatting
+        run: uv run --frozen ruff format --check src tests
+
+      - name: Lint
+        run: uv run --frozen ruff check src tests
+
+      - name: Type check
+        run: uv run --frozen mypy
+
+      - name: Test
+        run: uv run --frozen pytest -p no:cacheprovider -q
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --dev
+
+      - name: Scan source
+        run: uv run --frozen bandit --recursive src
+
+      - name: Export locked dependencies
+        run: >-
+          uv export --frozen --all-groups --no-emit-project --format requirements.txt
+          --output-file "${RUNNER_TEMP}/wheelguard-requirements.txt"
+
+      - name: Audit locked dependencies
+        run: >-
+          uv run --frozen pip-audit
+          --requirement "${RUNNER_TEMP}/wheelguard-requirements.txt"
+          --disable-pip --no-deps --progress-spinner off
+
+  cloudflare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - name: Install locked dependencies
+        run: uv sync --frozen --dev
+      - name: Validate Cloudflare Worker bundle
+        run: uv run --frozen pywrangler deploy --dry-run
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Build production image
+        run: docker build --tag wheelguard:ci .
+
+      - name: Export container root filesystem
+        run: |
+          container_id="$(docker create wheelguard:ci)"
+          docker export --output "${RUNNER_TEMP}/wheelguard-rootfs.tar" "${container_id}"
+          docker rm "${container_id}"
+          mkdir "${RUNNER_TEMP}/wheelguard-rootfs"
+          tar --extract --file "${RUNNER_TEMP}/wheelguard-rootfs.tar" \
+            --directory "${RUNNER_TEMP}/wheelguard-rootfs"
+
+      - name: Scan container
+        run: |
+          mkdir "${RUNNER_TEMP}/trivy-cache"
+          docker run --rm \
+            --volume "${RUNNER_TEMP}/wheelguard-rootfs:/rootfs:ro" \
+            --volume "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969 \
+            rootfs --scanners vuln,secret --severity HIGH,CRITICAL \
+            --skip-files '**/pip/_vendor/bom.cdx.json' \
+            --ignore-unfixed --exit-code 1 /rootfs
