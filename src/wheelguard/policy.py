@@ -30,7 +30,7 @@ class MinimumAgePolicy:
     """Hide artifacts until they have aged beyond a configured interval."""
 
     minimum_age: timedelta
-    allow_missing_upload_time: bool = True
+    allow_missing_upload_time: bool = False
 
     def apply(self, payload: SimplePayload, *, now: datetime) -> PolicyResult:
         """Filter artifacts that are newer than the configured minimum age."""
@@ -73,7 +73,7 @@ class ReleasePolicy:
     """Apply administrator overrides before the configured publication-age rule."""
 
     minimum_age: timedelta
-    allow_missing_upload_time: bool = True
+    allow_missing_upload_time: bool = False
 
     def apply(
         self,

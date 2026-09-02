@@ -101,7 +101,9 @@ class Default(WorkerEntrypoint):
         if access is None:
             return None
         expected_audience = getattr(self.env, "WHEELGUARD_ACCESS_AUD", None)
-        if expected_audience and not secrets.compare_digest(str(access.aud), str(expected_audience)):
+        if not isinstance(expected_audience, str) or not expected_audience:
+            return None
+        if not secrets.compare_digest(str(access.aud), expected_audience):
             return None
         identity = await access.getIdentity()
         email = getattr(identity, "email", None)

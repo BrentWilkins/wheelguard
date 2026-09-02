@@ -6,7 +6,13 @@
 	"compatibility_flags": [
 		"python_workers"
 	],
-  "workers_dev": true,
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "wheelguard.brent-wilkins.com",
+      "custom_domain": true
+    }
+  ],
   "triggers": {
     "crons": [
       "0 * * * *"
@@ -41,13 +47,13 @@
     "WHEELGUARD_UPSTREAM_URL": "https://pypi.org/simple/",
     "WHEELGUARD_MINIMUM_AGE_DAYS": "14",
     "WHEELGUARD_FALLBACK_MINIMUM_AGE_HOURS": "24",
-    "WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME": "true",
+    "WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME": "false",
     "WHEELGUARD_METADATA_TTL_SECONDS": "300",
     "WHEELGUARD_MAXIMUM_METADATA_BYTES": "1,900,000",
     "WHEELGUARD_MAXIMUM_ARTIFACT_BYTES": "104,857,600",
     "WHEELGUARD_ALLOWED_ARTIFACT_HOSTS": "files.pythonhosted.org",
     "WHEELGUARD_REQUIRE_AUTHENTICATION": "true",
-    "WHEELGUARD_ACCESS_AUD": "wheelguard-local-admin",
+    "WHEELGUARD_ACCESS_AUD": "bc50a505e7553d22f3a272743874685e722a721b0b803a58dcceaf03597a1eb8",
     "WHEELGUARD_OSV_ENABLED": "true",
     "WHEELGUARD_OSV_URL": "https://api.osv.dev/v1/querybatch",
     "WHEELGUARD_ADVISORY_TTL_SECONDS": "3,600",
@@ -55,7 +61,7 @@
   },
 	"access": {
 		"dev": {
-			"aud": "wheelguard-local-admin",
+			"aud": "bc50a505e7553d22f3a272743874685e722a721b0b803a58dcceaf03597a1eb8",
 			"identity": {
 				"email": "admin@example.com"
 			}

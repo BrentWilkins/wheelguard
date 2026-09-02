@@ -30,7 +30,7 @@ class Settings:
     minimum_age: timedelta = timedelta(days=14)
     fallback_minimum_age: timedelta = timedelta(hours=24)
     upstream_timeout_seconds: float = 30.0
-    allow_missing_upload_time: bool = True
+    allow_missing_upload_time: bool = False
     allowed_artifact_hosts: frozenset[str] = frozenset({"files.pythonhosted.org"})
     data_dir: Path = Path(".wheelguard-data")
     metadata_ttl: timedelta = timedelta(minutes=5)
@@ -68,7 +68,7 @@ class Settings:
             minimum_age=timedelta(days=_integer("WHEELGUARD_MINIMUM_AGE_DAYS", "14")),
             fallback_minimum_age=timedelta(hours=_integer("WHEELGUARD_FALLBACK_MINIMUM_AGE_HOURS", "24")),
             upstream_timeout_seconds=float(os.getenv("WHEELGUARD_UPSTREAM_TIMEOUT", "30")),
-            allow_missing_upload_time=_boolean("WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME", "true"),
+            allow_missing_upload_time=_boolean("WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME", "false"),
             allowed_artifact_hosts=hosts,
             data_dir=Path(os.getenv("WHEELGUARD_DATA_DIR", ".wheelguard-data")),
             metadata_ttl=timedelta(seconds=_integer("WHEELGUARD_METADATA_TTL_SECONDS", "300")),

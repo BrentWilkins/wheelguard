@@ -16,6 +16,12 @@ def test_default_advisory_refresh_window() -> None:
     assert settings.advisory_active_window == timedelta(days=30)
 
 
+def test_missing_upload_timestamps_fail_closed_by_default() -> None:
+    """Require an explicit compatibility opt-out from timestamp enforcement."""
+
+    assert Settings().allow_missing_upload_time is False
+
+
 def test_rejects_insecure_upstream_and_empty_artifact_allowlist() -> None:
     """Keep self-hosted network destinations explicit and encrypted."""
     with pytest.raises(ValueError, match="HTTPS URL"):

@@ -4,7 +4,7 @@
 **Basis:** working tree at git `4d31d72` plus uncommitted edits. Review ran against a snapshot taken
 at the start; the tree was re-diffed against that snapshot after the in-flight edits finished and is
 byte-identical, so line numbers are accurate. Findings name the enclosing function as well.
-**Live deployment probed (read-only GETs only):** `https://wheelguard.brent-814.workers.dev`
+**Live deployment probed (read-only GETs only):** the deployed Worker hostname
 
 ## Remediation status
 
@@ -12,21 +12,20 @@ All code-level findings were addressed in the hardening pass that followed this 
 
 | Finding | Resolution |
 |---|---|
-| 1 | Self-hosted upstreams now require HTTPS. Artifact URLs are admitted only from exact configured HTTPS hosts and the final redirect URL is revalidated. |
+| 1 | Self-hosted upstreams now require HTTPS. Artifact URLs are admitted only from exact configured HTTPS hosts, and every redirect target is validated before its request on both serving paths. Cached project metadata no longer registers artifact URLs implicitly. |
 | 2 | The automatic fixed-release exception has a configurable 1–336 hour floor (24 hours by default), a response marker, and a structured log event. |
 | 3, 15 | Authenticated artifacts now use private caching with `Vary: Authorization`; both serving paths add `nosniff`. |
-| 4, 5 | Missing-timestamp behavior is editable at the edge, and every administrator-editable integer has an enforced upper and lower bound. |
+| 4, 5 | Missing timestamps fail closed by default but remain editable for compatibility, and every administrator-editable integer has an enforced upper and lower bound. |
 | 6 | State-changing admin requests require a matching `Origin` or `Sec-Fetch-Site: same-origin`. |
-| 7 | Admin identity can be pinned to `WHEELGUARD_ACCESS_AUD`. The existing `workers.dev` ingress remains intentionally enabled until a custom repository domain exists; repository authentication still applies and admin routes fail closed without Access. |
-| 8–10 | SQLite operations run in a bounded executor, artifact locks use weak ownership, and self-hosted advisory refreshes are capped at 25 projects per pass by default. |
+| 7 | Admin identity must match a non-empty `WHEELGUARD_ACCESS_AUD`, and the `workers.dev` ingress is disabled after Custom Domain verification. |
+| 8–10 | SQLite operations use the event loop's bounded executor without polling, artifact locks use weak ownership, and self-hosted advisory refreshes are capped at 25 projects per pass by default. |
 | 11–13 | Repository authentication now precedes D1 settings reads, non-loopback self-hosted binds require authentication, and configured tokens must contain at least 32 characters. |
 | 14 | D1 migration `0002_immutable_policy_audit.sql` rejects audit-row updates and deletes. |
 | 16 | A CPython Worker-runtime harness now covers routing, pre-D1 authentication, Access audience checks, CSRF rejection, health access, and fallback observability. |
 | 17 | `actions/checkout` is pinned to the verified full commit SHA for v7.0.1. |
 
-The ingress item is deliberately an operational transition rather than an immediate configuration change: disabling
-`workers.dev` now would remove the only deployed repository hostname. The README records the custom-domain cutover and
-requires disabling that ingress afterward.
+The ingress change was staged as an operational transition: the Custom Domain and Access-protected admin paths were
+verified before disabling the fallback `workers.dev` hostname.
 
 ## Summary
 

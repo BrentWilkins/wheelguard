@@ -146,6 +146,11 @@ async def test_admin_access_audience_and_csrf_are_enforced(worker_modules: tuple
     application.ctx = SimpleNamespace(access=Access("wrong-audience"))
     assert (await application.fetch(FakeRequest("https://wheelguard.example/admin"))).status == 403
 
+    application.env = _edge_env(WHEELGUARD_ACCESS_AUD=None)
+    application.ctx = SimpleNamespace(access=Access("wheelguard-admin"))
+    assert (await application.fetch(FakeRequest("https://wheelguard.example/admin"))).status == 403
+
+    application.env = _edge_env(WHEELGUARD_ACCESS_AUD="wheelguard-admin")
     application.ctx = SimpleNamespace(access=Access("wheelguard-admin"))
     page = await application.fetch(FakeRequest("https://wheelguard.example/admin"))
     assert page.status == 200

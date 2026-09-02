@@ -1,4 +1,5 @@
 import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -6,7 +7,7 @@ import pytest
 
 from wheelguard.artifacts import ArtifactService, FileArtifactStore
 from wheelguard.database import Database
-from wheelguard.models import ArtifactDownloadError
+from wheelguard.models import ArtifactDownloadError, ProjectResponse
 
 
 @pytest.fixture
@@ -122,11 +123,13 @@ async def test_does_not_register_or_rewrite_untrusted_artifact_hosts(tmp_path: P
 
 @pytest.mark.anyio
 async def test_rejects_redirects_to_untrusted_hosts(tmp_path: Path) -> None:
-    """Revalidate the final URL after following an artifact redirect."""
+    """Reject an untrusted redirect target before requesting it."""
     content = b"artifact"
     digest = hashlib.sha256(content).hexdigest()
+    requests: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
         if request.url.host == "files.example":
             return httpx.Response(302, headers={"Location": "https://127.0.0.1/internal"}, request=request)
         return httpx.Response(200, content=content, request=request)
@@ -155,6 +158,33 @@ async def test_rejects_redirects_to_untrusted_hosts(tmp_path: Path) -> None:
         )
         with pytest.raises(ArtifactDownloadError, match="redirect target"):
             await service.get_path(digest, "demo.whl")
+        assert requests == ["https://files.example/demo.whl"]
+
+
+@pytest.mark.anyio
+async def test_cached_project_metadata_does_not_register_artifact_urls(tmp_path: Path) -> None:
+    """Require allowlist-aware rewriting before artifact registration."""
+
+    digest = hashlib.sha256(b"artifact").hexdigest()
+    database = Database(tmp_path / "wheelguard.db")
+    await database.initialize()
+    await database.put_project(
+        "demo",
+        ProjectResponse(
+            {
+                "files": [
+                    {
+                        "filename": "demo.whl",
+                        "url": "https://127.0.0.1/internal",
+                        "hashes": {"sha256": digest},
+                    }
+                ]
+            }
+        ),
+        fetched_at=datetime.now(UTC),
+    )
+
+    assert await database.get_artifact(digest, "demo.whl") is None
 
 
 @pytest.mark.anyio

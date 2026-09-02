@@ -33,6 +33,8 @@ from wheelguard.vulnerabilities import (
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _UPSTREAM_ACCEPT = "application/vnd.pypi.simple.v1+json"
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAXIMUM_REDIRECTS = 5
 
 
 class RepositoryError(Exception):
@@ -701,15 +703,10 @@ class CloudflareRepository:
             declared_size = await self._probe_artifact_size(source_url, self._settings.maximum_metadata_bytes)
         elif declared_size > self._settings.maximum_artifact_bytes:
             raise RepositoryError("Artifact exceeds configured size limit")
-        try:
-            response = await fetch(source_url, redirect="follow")
-        except Exception as error:
-            raise RepositoryError("Upstream artifact request failed") from error
+        response = await self._fetch_artifact(source_url)
         if not 200 <= response.status < 300:
             raise RepositoryError(f"Upstream artifact returned HTTP {response.status}")
         final_url = str(getattr(response, "url", source_url))
-        if not self._allowed_source(final_url):
-            raise RepositoryError("Artifact redirect target is not allowlisted")
         response_size = _content_length(response.headers.get("content-length"))
         known_size = response_size if response_size is not None else declared_size
         if known_size is None:
@@ -745,21 +742,40 @@ class CloudflareRepository:
 
     async def _probe_artifact_size(self, source_url: str, maximum_size: int) -> int:
         """Read a missing artifact size with an upstream HEAD request."""
-        try:
-            response = await fetch(source_url, method=HTTPMethod.HEAD, redirect="follow")
-        except Exception as error:
-            raise RepositoryError("Upstream artifact size request failed") from error
+        response = await self._fetch_artifact(source_url, method=HTTPMethod.HEAD)
         if not 200 <= response.status < 300:
             raise RepositoryError(f"Upstream artifact size request returned HTTP {response.status}")
-        final_url = str(getattr(response, "url", source_url))
-        if not self._allowed_source(final_url):
-            raise RepositoryError("Artifact size redirect target is not allowlisted")
         size = _content_length(response.headers.get("content-length"))
         if size is None:
             raise RepositoryError("Artifact size unknown")
         if size > maximum_size:
             raise RepositoryError("Artifact exceeds configured size limit")
         return size
+
+    async def _fetch_artifact(self, source_url: str, *, method: HTTPMethod | None = None) -> Any:
+        """Fetch an artifact after validating every redirect target before use."""
+        current_url = source_url
+        for redirect_count in range(_MAXIMUM_REDIRECTS + 1):
+            if not self._allowed_source(current_url):
+                raise RepositoryError("Artifact redirect target is not allowlisted")
+            options: dict[str, Any] = {"redirect": "manual"}
+            if method is not None:
+                options["method"] = method
+            try:
+                response = await fetch(current_url, **options)
+            except Exception as error:
+                raise RepositoryError("Upstream artifact request failed") from error
+            if response.status not in _REDIRECT_STATUSES:
+                return response
+
+            location = response.headers.get("location")
+            if location is None:
+                raise RepositoryError("Artifact redirect has no location")
+            if redirect_count == _MAXIMUM_REDIRECTS:
+                raise RepositoryError("Artifact exceeded redirect limit")
+            current_url = urljoin(current_url, str(location))
+
+        raise RepositoryError("Artifact exceeded redirect limit")
 
 
 def _positive_int(value: object, label: str) -> int:

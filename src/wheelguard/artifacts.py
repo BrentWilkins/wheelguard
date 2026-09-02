@@ -6,11 +6,12 @@ import os
 import re
 import tempfile
 import weakref
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -23,6 +24,8 @@ from wheelguard.models import (
 )
 
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+MAXIMUM_REDIRECTS = 5
 ArtifactUrl = Callable[[str, str], str]
 
 
@@ -66,7 +69,7 @@ class ArtifactService:
         self._maximum_bytes = maximum_bytes
         self._allowed_hosts = allowed_hosts
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(follow_redirects=True, timeout=60.0)
+        self._client = client or httpx.AsyncClient(follow_redirects=False, timeout=60.0)
         self._locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = weakref.WeakValueDictionary()
 
     async def rewrite_urls(self, payload: SimplePayload, *, url_for: ArtifactUrl) -> SimplePayload:
@@ -136,10 +139,8 @@ class ArtifactService:
         size = 0
         try:
             with os.fdopen(descriptor, "wb") as output:
-                async with self._client.stream("GET", record.source_url) as response:
+                async with self._stream_allowed(record.source_url) as response:
                     response.raise_for_status()
-                    if not _allowed_https_url(str(response.url), self._allowed_hosts):
-                        raise ArtifactDownloadError("Artifact redirect target is not allowed")
                     async for chunk in response.aiter_bytes():
                         size += len(chunk)
                         if size > self._maximum_bytes:
@@ -155,6 +156,32 @@ class ArtifactService:
             raise ArtifactDownloadError("Artifact download failed") from error
         finally:
             temporary.unlink(missing_ok=True)
+
+    @asynccontextmanager
+    async def _stream_allowed(self, source_url: str) -> AsyncIterator[httpx.Response]:
+        """Open an artifact response after validating every redirect target."""
+        current_url = source_url
+        for redirect_count in range(MAXIMUM_REDIRECTS + 1):
+            if not _allowed_https_url(current_url, self._allowed_hosts):
+                raise ArtifactDownloadError("Artifact redirect target is not allowed")
+            request = self._client.build_request("GET", current_url)
+            response = await self._client.send(request, stream=True, follow_redirects=False)
+            if response.status_code not in REDIRECT_STATUSES:
+                try:
+                    yield response
+                finally:
+                    await response.aclose()
+                return
+
+            location = response.headers.get("location")
+            await response.aclose()
+            if location is None:
+                raise ArtifactDownloadError("Artifact redirect has no location")
+            if redirect_count == MAXIMUM_REDIRECTS:
+                raise ArtifactDownloadError("Artifact exceeded redirect limit")
+            current_url = urljoin(current_url, location)
+
+        raise ArtifactDownloadError("Artifact exceeded redirect limit")
 
 
 def _sha256(file: dict[str, Any]) -> str | None:

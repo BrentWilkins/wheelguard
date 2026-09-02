@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +20,8 @@ def _database_io[**P, R](operation: Callable[P, R]) -> Callable[P, Awaitable[R]]
     """Run one blocking SQLite operation outside the event-loop thread."""
 
     async def offloaded(*args: P.args, **kwargs: P.kwargs) -> R:
-        future = _DATABASE_EXECUTOR.submit(operation, *args, **kwargs)
-        while not future.done():
-            await asyncio.sleep(0.001)
-        return future.result()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_DATABASE_EXECUTOR, partial(operation, *args, **kwargs))
 
     return offloaded
 
@@ -129,7 +128,6 @@ class Database:
         fetched_at: datetime,
     ) -> None:
         encoded = json.dumps(response.payload, separators=(",", ":"), sort_keys=True)
-        records = list(_artifact_records(response.payload))
         with sqlite3.connect(self._path) as connection:
             connection.execute(
                 """
@@ -142,7 +140,6 @@ class Database:
                 """,
                 (normalized_name, encoded, response.last_serial, fetched_at.timestamp()),
             )
-            self._write_artifacts(connection, records)
 
     @_database_io
     def register_artifacts(self, payload: SimplePayload) -> None:

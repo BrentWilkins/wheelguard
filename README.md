@@ -159,9 +159,8 @@ validated `ctx.access` identity. The administrator
 interface uses the trusted Access identity; it does not have or need a second application token. The repository token is
 separate because package managers do not authenticate through an interactive Access login.
 
-The `workers.dev` route remains enabled because it is currently the repository hostname. Repository paths still require
-the repository token, and admin paths fail closed unless Access supplied a valid identity. When moving to a custom
-domain, disable `workers_dev` in `wrangler.jsonc` after verifying the custom repository and Access-protected admin paths.
+Use a verified Custom Domain for production and set `workers_dev` to `false` after cutover. Repository paths still
+require the repository token, and admin paths fail closed unless Access supplied a valid identity.
 
 ## Testing the proxy
 
@@ -337,7 +336,7 @@ deployment.
 | `WHEELGUARD_UPSTREAM_URL` | `https://pypi.org/simple/` | Upstream Simple API |
 | `WHEELGUARD_MINIMUM_AGE_DAYS` | `14` | Minimum artifact age |
 | `WHEELGUARD_FALLBACK_MINIMUM_AGE_HOURS` | `24` | Minimum age before a fixed release may bypass the normal age policy |
-| `WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME` | `true` | Fail open for missing timestamps |
+| `WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME` | `false` | Fail closed when upload timestamps are missing or invalid |
 | `WHEELGUARD_ALLOWED_ARTIFACT_HOSTS` | `files.pythonhosted.org` | Exact HTTPS hosts the downloader may contact |
 | `WHEELGUARD_UPSTREAM_TIMEOUT` | `30` | Upstream timeout in seconds |
 | `WHEELGUARD_DATA_DIR` | `.wheelguard-data` | Metadata database and artifact storage |

@@ -27,10 +27,15 @@ def test_cutoff_is_inclusive() -> None:
 
 
 def test_missing_time_can_fail_closed() -> None:
-    result = MinimumAgePolicy(timedelta(days=14), allow_missing_upload_time=False).apply(
+    result = MinimumAgePolicy(timedelta(days=14)).apply({"files": [{"filename": "demo-1.0.tar.gz"}]}, now=NOW)
+    assert result.hidden_files == 1
+
+
+def test_missing_time_can_be_allowed_explicitly() -> None:
+    result = MinimumAgePolicy(timedelta(days=14), allow_missing_upload_time=True).apply(
         {"files": [{"filename": "demo-1.0.tar.gz"}]}, now=NOW
     )
-    assert result.hidden_files == 1
+    assert result.visible_files == 1
 
 
 def test_clock_must_be_timezone_aware() -> None:

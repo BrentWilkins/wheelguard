@@ -80,8 +80,8 @@ async def test_metadata_sidecar_probes_missing_size_before_streaming(monkeypatch
     )
 
     assert requests == [
-        {"url": source_url, "method": HTTPMethod.HEAD, "redirect": "follow"},
-        {"url": source_url, "redirect": "follow"},
+        {"url": source_url, "method": HTTPMethod.HEAD, "redirect": "manual"},
+        {"url": source_url, "redirect": "manual"},
     ]
     assert bucket.puts[0][0] == ("sha256/demo/demo.whl.metadata", buffered_body)
     assert "sha256" not in bucket.puts[0][1]
@@ -93,3 +93,27 @@ async def test_metadata_sidecar_probes_missing_size_before_streaming(monkeypatch
             {"source_url": source_url, "size": None, "verification_sha256": "0" * 64},
         )
     assert len(bucket.puts) == 1
+
+
+@pytest.mark.anyio
+async def test_rejects_untrusted_redirect_before_worker_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Do not issue a Worker subrequest to an untrusted redirect target."""
+
+    module = _cloudflare_index(monkeypatch)
+    requests: list[str] = []
+
+    async def fake_fetch(url: str, **_options: Any) -> Any:
+        requests.append(url)
+        return SimpleNamespace(
+            status=302,
+            headers={"location": "https://127.0.0.1/internal"},
+            url=url,
+        )
+
+    repository = module.CloudflareRepository.__new__(module.CloudflareRepository)
+    repository._settings = SimpleNamespace(allowed_artifact_hosts=frozenset({"files.pythonhosted.org"}))
+    monkeypatch.setattr(module, "fetch", fake_fetch)
+
+    with pytest.raises(module.RepositoryError, match="redirect target"):
+        await repository._fetch_artifact("https://files.pythonhosted.org/packages/demo.whl")
+    assert requests == ["https://files.pythonhosted.org/packages/demo.whl"]
