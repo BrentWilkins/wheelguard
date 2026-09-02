@@ -3,6 +3,7 @@ name = "wheelguard"
 version = "0.1.0"
 description = "A policy-aware, outage-resistant Python package index proxy"
 readme = "README.md"
+license = "Apache-2.0"
 authors = [
     { name = "Brent Wilkins", email = "218822+BrentWilkins@users.noreply.github.com" }
 ]

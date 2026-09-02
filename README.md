@@ -255,23 +255,37 @@ used within the active window. The first request remains protected by the synchr
 The assumptions around OSV.dev availability, company use, privacy, and source licensing are recorded in
 [`docs/external-services.md`](docs/external-services.md).
 
-To see the resolver behavior against a deployed Worker, configure Wheelguard as the project's default uv index and
-keep its token in the named-index credential variables:
+To see the resolver behavior against a deployed Worker, configure Wheelguard as the project's default uv index. The
+index URL is safe to commit; the repository token is not:
 
 ```toml
+[tool.uv]
+# Store index credentials in the operating system's encrypted credential store.
+preview-features = ["native-auth"]
+
 [[tool.uv.index]]
 name = "wheelguard"
-url = "https://<your-worker>.<your-subdomain>.workers.dev/simple/"
+url = "https://packages.example.com/simple/"
 default = true
 authenticate = "always"
 ```
 
+On Ubuntu Desktop, uv's native authentication backend uses the Secret Service API provided by GNOME Keyring. Sign in
+once from the consuming project and enter the Wheelguard repository token at the password prompt:
+
 ```shell
 cd /path/to/project
-export UV_INDEX_WHEELGUARD_USERNAME=wheelguard
-# Set UV_INDEX_WHEELGUARD_PASSWORD through your shell's secure prompt or a secret manager.
+UV_PREVIEW_FEATURES=native-auth \
+  uv auth login packages.example.com --username wheelguard
 uv add 'idna==3.10'
 ```
+
+The explicit environment variable enables native storage for the login itself; the committed `preview-features`
+setting enables retrieval during later project commands. Ubuntu Server and other headless sessions may not have an
+unlocked Secret Service provider. In that case, use uv's user-local plaintext credential store by omitting
+`UV_PREVIEW_FEATURES=native-auth` and the `preview-features` setting, or supply
+`UV_INDEX_WHEELGUARD_USERNAME` and `UV_INDEX_WHEELGUARD_PASSWORD` from a secret manager. The plaintext uv store is
+comparable to a carefully protected `.env` file, but it is shared by host rather than copied into each project.
 
 An exact pin to this known-vulnerable release remains installable, but uv surfaces Wheelguard's PEP 592 warning:
 
@@ -292,7 +306,8 @@ Installed 2 packages in 3ms
 ```
 
 Timings and package counts vary. Do not place the repository token in `pyproject.toml`, `uv.lock`, the index URL, or
-shell history.
+shell history. Remove the locally stored credential with `uv auth logout packages.example.com`; this does not revoke
+the token at the Wheelguard server.
 
 ### Authentication
 
@@ -361,3 +376,9 @@ When authentication is enabled, Wheelguard accepts the token as either a Bearer 
 Basic password (the username is ignored). Keep the repository URL itself credential-free in
 committed configuration. Supply credentials through the package manager's environment-variable or
 keyring support so private URLs cannot be written into a public lockfile.
+
+## License
+
+Copyright 2026 Brent Wilkins.
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
