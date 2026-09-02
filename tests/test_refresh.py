@@ -5,7 +5,6 @@ import pytest
 
 from wheelguard.database import Database
 from wheelguard.models import AdvisoryResult, ProjectResponse, SimplePayload
-from wheelguard.policy import MinimumAgePolicy
 from wheelguard.refresh import AdvisoryRefresher
 
 
@@ -44,7 +43,6 @@ async def test_refreshes_only_recently_requested_cached_projects(tmp_path: Path)
     refresher = AdvisoryRefresher(
         database,
         policy,
-        MinimumAgePolicy(timedelta(days=14)),
         active_window=timedelta(days=30),
         clock=lambda: now,
     )
@@ -54,3 +52,15 @@ async def test_refreshes_only_recently_requested_cached_projects(tmp_path: Path)
     assert evaluated == 1
     assert policy.projects == ["active"]
     assert await database.list_advisory_targets(requested_since=now - timedelta(days=40)) == ["active"]
+
+
+@pytest.mark.anyio
+async def test_advisory_target_batch_is_bounded(tmp_path: Path) -> None:
+    """Limit each refresh pass even when many projects are active."""
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    database = Database(tmp_path / "wheelguard.db")
+    await database.initialize()
+    for index in range(5):
+        await database.record_advisory_target(f"project-{index}", requested_at=now + timedelta(seconds=index))
+    targets = await database.list_advisory_targets(requested_since=now - timedelta(days=1), limit=2)
+    assert targets == ["project-4", "project-3"]

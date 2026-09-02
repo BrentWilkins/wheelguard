@@ -86,8 +86,9 @@ def automatic_fixed_version_allows(
     *,
     now: datetime,
     minimum_age: timedelta,
+    fallback_minimum_age: timedelta,
 ) -> dict[str, str]:
-    """Allow the newest fresh fixed release when every aged candidate is known vulnerable."""
+    """Allow a fixed release only after its emergency minimum age has elapsed."""
     if now.tzinfo is None:
         raise ValueError("now must include timezone information")
     if not any(advisories.values()):
@@ -96,6 +97,7 @@ def automatic_fixed_version_allows(
     if not isinstance(files, list):
         return {}
     cutoff = now.astimezone(UTC) - minimum_age
+    fallback_cutoff = now.astimezone(UTC) - fallback_minimum_age
     aged_safe: set[Version] = set()
     fresh_safe: set[Version] = set()
     for file in files:
@@ -107,7 +109,7 @@ def automatic_fixed_version_allows(
         uploaded = _upload_time(file.get("upload-time"))
         if uploaded is None or uploaded <= cutoff:
             aged_safe.add(version)
-        else:
+        elif uploaded <= fallback_cutoff:
             fresh_safe.add(version)
     if aged_safe or not fresh_safe:
         return {}

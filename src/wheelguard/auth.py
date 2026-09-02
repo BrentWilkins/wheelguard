@@ -4,12 +4,16 @@ import base64
 import binascii
 import hmac
 
+MINIMUM_TOKEN_LENGTH = 32
+
 
 class TokenAuthenticator:
     """Validate Basic-password or Bearer credentials against one token."""
 
     def __init__(self, token: str | None) -> None:
         """Initialize optional token authentication."""
+        if token is not None and len(token) < MINIMUM_TOKEN_LENGTH:
+            raise ValueError(f"Authentication tokens must contain at least {MINIMUM_TOKEN_LENGTH} characters")
         self._token = token
 
     @property

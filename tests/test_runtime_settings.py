@@ -25,7 +25,9 @@ def test_partial_update_accepts_grouped_integers_and_boolean() -> None:
     [
         ({}, "At least one"),
         ({"unknown": 1}, "Unknown setting"),
-        ({"minimum_age_days": -1}, "at least 0"),
+        ({"minimum_age_days": -1}, "at least 1"),
+        ({"minimum_age_days": 366}, "at most 365"),
+        ({"maximum_artifact_bytes": 104_857_601}, "at most 104,857,600"),
         ({"osv_enabled": "yes"}, "true or false"),
     ],
 )
@@ -45,6 +47,8 @@ def test_corrupt_or_unknown_database_values_are_ignored() -> None:
 def test_catalog_distinguishes_defaults_from_overrides() -> None:
     defaults = {
         "minimum_age_days": 14,
+        "fallback_minimum_age_hours": 24,
+        "allow_missing_upload_time": True,
         "metadata_ttl_seconds": 300,
         "maximum_artifact_bytes": 104_857_600,
         "osv_enabled": True,

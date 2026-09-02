@@ -62,7 +62,13 @@ async def test_warmed_project_survives_complete_upstream_outage(tmp_path: Path) 
         return httpx.Response(200, content=wheel, request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(online_handler)) as upstream:
-        artifacts = ArtifactService(database, store, maximum_bytes=1024, client=upstream)
+        artifacts = ArtifactService(
+            database,
+            store,
+            maximum_bytes=1024,
+            allowed_hosts=frozenset({"files.example"}),
+            client=upstream,
+        )
         application = create_app(
             settings=settings,
             repository=OnlineRepository(digest, len(wheel)),
@@ -76,13 +82,22 @@ async def test_warmed_project_survives_complete_upstream_outage(tmp_path: Path) 
         ):
             metadata = await client.get("/simple/demo/", headers={"Accept": SIMPLE_JSON})
             artifact = await client.get(metadata.json()["files"][0]["url"])
-    assert artifact.content == wheel
+            assert artifact.content == wheel
+            assert artifact.headers["cache-control"].startswith("private,")
+            assert artifact.headers["vary"] == "Authorization"
+            assert artifact.headers["x-content-type-options"] == "nosniff"
 
     def offline_handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"cached artifact unexpectedly requested {request.url}")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(offline_handler)) as upstream:
-        artifacts = ArtifactService(database, store, maximum_bytes=1024, client=upstream)
+        artifacts = ArtifactService(
+            database,
+            store,
+            maximum_bytes=1024,
+            allowed_hosts=frozenset({"files.example"}),
+            client=upstream,
+        )
         application = create_app(
             settings=settings,
             repository=OfflineRepository(),

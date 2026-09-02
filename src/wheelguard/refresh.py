@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 
 from wheelguard.database import Database
 from wheelguard.models import AdvisoryPolicy
-from wheelguard.policy import MinimumAgePolicy
 
 Clock = Callable[[], datetime]
 LOGGER = logging.getLogger(__name__)
@@ -20,23 +19,23 @@ class AdvisoryRefresher:
         self,
         database: Database,
         advisory_policy: AdvisoryPolicy,
-        release_policy: MinimumAgePolicy,
         *,
         active_window: timedelta,
+        batch_size: int = 25,
         clock: Clock | None = None,
     ) -> None:
         """Initialize a refresher over the persistent project catalog."""
         self._database = database
         self._advisory_policy = advisory_policy
-        self._release_policy = release_policy
         self._active_window = active_window
+        self._batch_size = batch_size
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def refresh_once(self) -> int:
         """Refresh advisories once and return the number of evaluated projects."""
         now = self._clock()
         cutoff = now - self._active_window
-        targets = await self._database.list_advisory_targets(requested_since=cutoff)
+        targets = await self._database.list_advisory_targets(requested_since=cutoff, limit=self._batch_size)
         await self._database.prune_advisory_targets(requested_before=cutoff)
         evaluated = 0
         for project in targets:
@@ -44,8 +43,7 @@ class AdvisoryRefresher:
             if cached is None:
                 await self._database.delete_advisory_target(project)
                 continue
-            visible = self._release_policy.apply(cached.response.payload, now=now)
-            result = await self._advisory_policy.apply(project, visible.payload)
+            result = await self._advisory_policy.apply(project, cached.response.payload)
             if result.vulnerable_files:
                 LOGGER.warning(
                     "Advisory refresh found %d vulnerable files for %s",

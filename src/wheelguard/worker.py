@@ -23,6 +23,7 @@ from wheelguard.runtime_settings import (
 JSON_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Type": "application/json; charset=utf-8",
+    "X-Content-Type-Options": "nosniff",
 }
 
 
@@ -98,6 +99,9 @@ class Default(WorkerEntrypoint):
         """Return the Access-authenticated administrator identity."""
         access = getattr(self.ctx, "access", None)
         if access is None:
+            return None
+        expected_audience = getattr(self.env, "WHEELGUARD_ACCESS_AUD", None)
+        if expected_audience and not secrets.compare_digest(str(access.aud), str(expected_audience)):
             return None
         identity = await access.getIdentity()
         email = getattr(identity, "email", None)
@@ -409,15 +413,16 @@ def _python(value: Any) -> Any:
 
 
 def _reject_cross_origin_write(request: Any) -> Response | None:
-    """Reject browser writes whose Origin does not match the Worker origin."""
+    """Require browser evidence that an administrator write is same-origin."""
     origin = request.headers.get("origin")
-    if origin is None:
-        return None
+    fetch_site = (request.headers.get("sec-fetch-site") or "").casefold()
     target = urlsplit(request.url)
     expected = f"{target.scheme}://{target.netloc}"
-    if origin != expected:
-        return _error("Cross-origin administrator writes are not allowed", 403)
-    return None
+    if origin == expected or (origin is None and fetch_site == "same-origin"):
+        return None
+    if origin is None and not fetch_site:
+        return _error("Administrator writes require Origin or Sec-Fetch-Site", 403)
+    return _error("Cross-origin administrator writes are not allowed", 403)
 
 
 def _now() -> str:
@@ -597,6 +602,13 @@ _ADMIN_HTML = """<!doctype html>
         } else {
           input = document.createElement('input'); input.type = 'text'; input.inputMode = 'numeric';
           input.pattern = '[0-9][0-9,_]*'; input.value = integerFormatter.format(setting.value);
+          input.oninput = () => {
+            const value = Number(normalizedSettingValue(input));
+            const valid = Number.isSafeInteger(value) && value >= setting.minimum && value <= setting.maximum;
+            const minimum = integerFormatter.format(setting.minimum);
+            const maximum = integerFormatter.format(setting.maximum);
+            input.setCustomValidity(valid ? '' : `Enter ${minimum}–${maximum}.`);
+          };
           input.onblur = () => {
             const value = Number(normalizedSettingValue(input));
             if (Number.isSafeInteger(value)) input.value = integerFormatter.format(value);
@@ -607,7 +619,9 @@ _ADMIN_HTML = """<!doctype html>
         const detail = document.createElement('small');
         const suffix = setting.overridden ? ' Overridden.' : '';
         const defaultValue = setting.kind === 'integer' ? integerFormatter.format(setting.default) : setting.default;
-        detail.textContent = `${setting.description} Default: ${defaultValue}.${suffix}`;
+        const limits = setting.kind === 'integer'
+          ? ` Allowed: ${integerFormatter.format(setting.minimum)}–${integerFormatter.format(setting.maximum)}.` : '';
+        detail.textContent = `${setting.description} Default: ${defaultValue}.${limits}${suffix}`;
         const reset = document.createElement('button'); reset.type = 'button'; reset.textContent = 'Reset to default';
         reset.disabled = !setting.overridden;
         reset.onclick = async () => {

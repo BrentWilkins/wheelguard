@@ -1,5 +1,7 @@
 from datetime import timedelta
 
+import pytest
+
 from wheelguard.config import Settings
 
 
@@ -12,3 +14,11 @@ def test_default_advisory_refresh_window() -> None:
 
     assert settings.advisory_refresh_interval == timedelta(hours=1)
     assert settings.advisory_active_window == timedelta(days=30)
+
+
+def test_rejects_insecure_upstream_and_empty_artifact_allowlist() -> None:
+    """Keep self-hosted network destinations explicit and encrypted."""
+    with pytest.raises(ValueError, match="HTTPS URL"):
+        Settings(upstream_url="http://pypi.example/simple/")
+    with pytest.raises(ValueError, match="cannot be empty"):
+        Settings(allowed_artifact_hosts=frozenset())

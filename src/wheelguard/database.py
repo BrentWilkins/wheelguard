@@ -1,14 +1,30 @@
 """Persist project metadata and artifact records in SQLite."""
 
+import asyncio
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from wheelguard.models import ArtifactRecord, ProjectResponse, SimplePayload
+
+_DATABASE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wheelguard-sqlite")
+
+
+def _database_io[**P, R](operation: Callable[P, R]) -> Callable[P, Awaitable[R]]:
+    """Run one blocking SQLite operation outside the event-loop thread."""
+
+    async def offloaded(*args: P.args, **kwargs: P.kwargs) -> R:
+        future = _DATABASE_EXECUTOR.submit(operation, *args, **kwargs)
+        while not future.done():
+            await asyncio.sleep(0.001)
+        return future.result()
+
+    return offloaded
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +50,8 @@ class Database:
         """Initialize a database located at ``path``."""
         self._path = path
 
-    async def initialize(self) -> None:
+    @_database_io
+    def initialize(self) -> None:
         """Create the database directory and schema when absent."""
         self._initialize()
 
@@ -73,7 +90,8 @@ class Database:
             """
             )
 
-    async def get_project(self, normalized_name: str) -> CachedProject | None:
+    @_database_io
+    def get_project(self, normalized_name: str) -> CachedProject | None:
         """Return cached project metadata by normalized name."""
         return self._get_project(normalized_name)
 
@@ -93,7 +111,8 @@ class Database:
             datetime.fromtimestamp(row[2], tz=UTC),
         )
 
-    async def put_project(
+    @_database_io
+    def put_project(
         self,
         normalized_name: str,
         response: ProjectResponse,
@@ -125,7 +144,8 @@ class Database:
             )
             self._write_artifacts(connection, records)
 
-    async def register_artifacts(self, payload: SimplePayload) -> None:
+    @_database_io
+    def register_artifacts(self, payload: SimplePayload) -> None:
         """Register artifact locations discovered in a Simple API payload."""
         self._register_artifacts(payload)
 
@@ -149,7 +169,8 @@ class Database:
             [(r.sha256, r.filename, r.source_url, r.size) for r in records],
         )
 
-    async def get_artifact(self, sha256: str, filename: str) -> ArtifactRecord | None:
+    @_database_io
+    def get_artifact(self, sha256: str, filename: str) -> ArtifactRecord | None:
         """Look up an artifact by digest and filename."""
         return self._get_artifact(sha256, filename)
 
@@ -166,13 +187,15 @@ class Database:
             return None
         return ArtifactRecord(sha256, filename, row[0], row[1])
 
-    async def list_projects(self) -> list[str]:
+    @_database_io
+    def list_projects(self) -> list[str]:
         """List normalized names for all cached projects."""
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute("SELECT normalized_name FROM projects ORDER BY normalized_name").fetchall()
         return [row[0] for row in rows]
 
-    async def record_advisory_target(self, project: str, *, requested_at: datetime) -> None:
+    @_database_io
+    def record_advisory_target(self, project: str, *, requested_at: datetime) -> None:
         """Record recent client interest in a project for periodic advisory refresh."""
         with sqlite3.connect(self._path) as connection:
             connection.execute(
@@ -184,7 +207,8 @@ class Database:
                 (project, requested_at.timestamp()),
             )
 
-    async def list_advisory_targets(self, *, requested_since: datetime) -> list[str]:
+    @_database_io
+    def list_advisory_targets(self, *, requested_since: datetime, limit: int = 25) -> list[str]:
         """List projects requested within the active advisory window."""
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute(
@@ -192,12 +216,14 @@ class Database:
                 SELECT project FROM advisory_targets
                 WHERE requested_at >= ?
                 ORDER BY requested_at DESC
+                LIMIT ?
                 """,
-                (requested_since.timestamp(),),
+                (requested_since.timestamp(), limit),
             ).fetchall()
         return [row[0] for row in rows]
 
-    async def prune_advisory_targets(self, *, requested_before: datetime) -> None:
+    @_database_io
+    def prune_advisory_targets(self, *, requested_before: datetime) -> None:
         """Delete advisory targets outside the active window."""
         with sqlite3.connect(self._path) as connection:
             connection.execute(
@@ -205,12 +231,14 @@ class Database:
                 (requested_before.timestamp(),),
             )
 
-    async def delete_advisory_target(self, project: str) -> None:
+    @_database_io
+    def delete_advisory_target(self, project: str) -> None:
         """Delete an advisory target that cannot be evaluated."""
         with sqlite3.connect(self._path) as connection:
             connection.execute("DELETE FROM advisory_targets WHERE project = ?", (project,))
 
-    async def get_advisories(self, project: str, versions_key: str) -> CachedAdvisories | None:
+    @_database_io
+    def get_advisories(self, project: str, versions_key: str) -> CachedAdvisories | None:
         """Return a cached advisory result for an exact version set."""
         with sqlite3.connect(self._path) as connection:
             row = connection.execute(
@@ -232,7 +260,8 @@ class Database:
         }
         return CachedAdvisories(advisories, datetime.fromtimestamp(row[1], tz=UTC))
 
-    async def put_advisories(
+    @_database_io
+    def put_advisories(
         self,
         project: str,
         versions_key: str,

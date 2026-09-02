@@ -30,6 +30,7 @@ def test_known_vulnerability_is_yanked_and_fresh_fix_is_allowed() -> None:
         advisories,
         now=datetime(2026, 9, 1, tzinfo=UTC),
         minimum_age=timedelta(days=14),
+        fallback_minimum_age=timedelta(hours=24),
     )
 
     assert marked["files"][0]["yanked"] == "Wheelguard advisories: GHSA-test"
@@ -45,8 +46,23 @@ def test_fresh_release_is_not_needed_when_an_aged_safe_release_exists() -> None:
         {"1.0": ["GHSA-test"], "1.1": [], "2.0": []},
         now=datetime(2026, 9, 1, tzinfo=UTC),
         minimum_age=timedelta(days=14),
+        fallback_minimum_age=timedelta(hours=24),
     )
 
+    assert allows == {}
+
+
+def test_fixed_release_younger_than_fallback_floor_is_not_allowed() -> None:
+    """Do not trade a known vulnerability for an unseasoned release immediately."""
+    payload = _payload()
+    payload["files"][1]["upload-time"] = "2026-08-31T12:00:00Z"  # type: ignore[index]
+    allows = automatic_fixed_version_allows(
+        payload,
+        {"1.0": ["GHSA-test"], "2.0": []},
+        now=datetime(2026, 9, 1, tzinfo=UTC),
+        minimum_age=timedelta(days=14),
+        fallback_minimum_age=timedelta(hours=24),
+    )
     assert allows == {}
 
 

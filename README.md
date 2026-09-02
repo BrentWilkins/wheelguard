@@ -56,7 +56,9 @@ Build and run the production container with persistent cache storage:
 
 ```shell
 docker build -t wheelguard .
-docker run --rm -p 8000:8000 -v wheelguard-data:/data wheelguard
+docker run --rm -p 127.0.0.1:8000:8000 \
+  -e WHEELGUARD_AUTH_TOKEN="$WHEELGUARD_AUTH_TOKEN" \
+  -v wheelguard-data:/data wheelguard
 ```
 
 ### Cloudflare development
@@ -108,6 +110,17 @@ The minimum release age controls automatic eligibility, not override lifetime. A
 optional expiry, revocation, or replacement. Expired, replaced, and revoked records remain available in the history and
 `policy_audit`; the interface deliberately does not permanently delete them.
 
+The vulnerability fallback has its own floor (24 hours by default). If every normally aged release is known vulnerable,
+Wheelguard may expose the newest non-vulnerable release only after that floor. Before then it keeps the known-vulnerable
+release yanked and the too-new fix hidden; an administrator can make a documented override if waiting is riskier. Once
+the floor is reached the exception is automatic until the release reaches the normal minimum age. Responses append
+`vulnerability-fallback` to `X-Wheelguard-Policy`, and the Worker emits a structured
+`policy.vulnerability_fallback` log event with the project and allowed versions.
+
+Runtime integer settings are bounded: release age 1–365 days, fallback age 1–336 hours, metadata TTL 1–86,400 seconds,
+artifact size 1–104,857,600 bytes, advisory TTL 60–604,800 seconds, and active-project window 1–365 days. Invalid values
+return a visible `422` error and are not stored.
+
 The automated suite separately verifies request validation, setting bounds, allow/block precedence, and default resets.
 Use only disposable overrides for local testing. For production, configure Cloudflare Access first and use a short-lived
 override that you immediately revoke.
@@ -140,9 +153,15 @@ uv run pywrangler secret put WHEELGUARD_AUTH_TOKEN
 The initial publish deliberately returns `503` from repository routes until the secret exists. Updating the secret
 creates a new Worker version, so a second deploy is not required.
 
-Protect `/admin/*` with a Cloudflare Access application before treating the deployment as production. The administrator
+Protect `/admin/*` with a Cloudflare Access application before treating the deployment as production. Set
+`WHEELGUARD_ACCESS_AUD` to that application's audience tag to add an application-specific check on top of Cloudflare's
+validated `ctx.access` identity. The administrator
 interface uses the trusted Access identity; it does not have or need a second application token. The repository token is
 separate because package managers do not authenticate through an interactive Access login.
+
+The `workers.dev` route remains enabled because it is currently the repository hostname. Repository paths still require
+the repository token, and admin paths fail closed unless Access supplied a valid identity. When moving to a custom
+domain, disable `workers_dev` in `wrangler.jsonc` after verifying the custom repository and Access-protected admin paths.
 
 ## Testing the proxy
 
@@ -211,7 +230,7 @@ metadata cache, and an unreachable upstream:
 ```shell
 WHEELGUARD_DATA_DIR=/tmp/wheelguard-manual \
 WHEELGUARD_METADATA_TTL_SECONDS=0 \
-WHEELGUARD_UPSTREAM_URL=http://127.0.0.1:9/simple/ \
+WHEELGUARD_UPSTREAM_URL=https://127.0.0.1:9/simple/ \
 uv run wheelguard
 ```
 
@@ -282,7 +301,7 @@ Start Wheelguard with a test token:
 
 ```shell
 WHEELGUARD_DATA_DIR=/tmp/wheelguard-auth-test \
-WHEELGUARD_AUTH_TOKEN=test-secret \
+WHEELGUARD_AUTH_TOKEN=test-secret-0123456789abcdef0123456789 \
 uv run wheelguard
 ```
 
@@ -290,7 +309,7 @@ An unauthenticated `/simple/` request returns `401`. Test Bearer authentication 
 
 ```shell
 curl -i \
-  -H 'Authorization: Bearer test-secret' \
+  -H 'Authorization: Bearer test-secret-0123456789abcdef0123456789' \
   -H 'Accept: application/vnd.pypi.simple.v1+json' \
   http://127.0.0.1:8000/simple/idna/
 ```
@@ -301,7 +320,7 @@ variables:
 ```shell
 UV_INDEX='wheelguard=http://127.0.0.1:8000/simple' \
 UV_INDEX_WHEELGUARD_USERNAME=wheelguard \
-UV_INDEX_WHEELGUARD_PASSWORD=test-secret \
+UV_INDEX_WHEELGUARD_PASSWORD=test-secret-0123456789abcdef0123456789 \
 uv pip install \
   --python /tmp/wheelguard-client/bin/python \
   --no-cache \
@@ -317,7 +336,9 @@ deployment.
 |---|---:|---|
 | `WHEELGUARD_UPSTREAM_URL` | `https://pypi.org/simple/` | Upstream Simple API |
 | `WHEELGUARD_MINIMUM_AGE_DAYS` | `14` | Minimum artifact age |
+| `WHEELGUARD_FALLBACK_MINIMUM_AGE_HOURS` | `24` | Minimum age before a fixed release may bypass the normal age policy |
 | `WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME` | `true` | Fail open for missing timestamps |
+| `WHEELGUARD_ALLOWED_ARTIFACT_HOSTS` | `files.pythonhosted.org` | Exact HTTPS hosts the downloader may contact |
 | `WHEELGUARD_UPSTREAM_TIMEOUT` | `30` | Upstream timeout in seconds |
 | `WHEELGUARD_DATA_DIR` | `.wheelguard-data` | Metadata database and artifact storage |
 | `WHEELGUARD_METADATA_TTL_SECONDS` | `300` | Fresh metadata cache lifetime |
@@ -327,9 +348,15 @@ deployment.
 | `WHEELGUARD_ADVISORY_TTL_SECONDS` | `21600` | Fresh advisory scan lifetime |
 | `WHEELGUARD_ADVISORY_REFRESH_SECONDS` | `3600` | Interval between active-project refreshes |
 | `WHEELGUARD_ADVISORY_ACTIVE_DAYS` | `30` | Retain and periodically scan recently requested projects |
+| `WHEELGUARD_ADVISORY_REFRESH_BATCH_SIZE` | `25` | Maximum self-hosted projects scanned per periodic pass |
 | `WHEELGUARD_AUTH_TOKEN` | unset | Protect `/simple` and `/files` with a shared token |
+| `WHEELGUARD_ACCESS_AUD` | unset | Optional expected Cloudflare Access application audience for `/admin` |
 | `WHEELGUARD_HOST` | `127.0.0.1` | Listening host |
 | `WHEELGUARD_PORT` | `8000` | Listening port |
+
+Authentication tokens must contain at least 32 characters. Wheelguard refuses to bind the self-hosted server to a
+non-loopback address without one. Upstream, OSV, and artifact-source URLs must use HTTPS; artifact redirects are checked
+again after they are followed.
 
 When authentication is enabled, Wheelguard accepts the token as either a Bearer token or an HTTP
 Basic password (the username is ignored). Keep the repository URL itself credential-free in

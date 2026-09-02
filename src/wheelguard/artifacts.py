@@ -5,10 +5,12 @@ import hashlib
 import os
 import re
 import tempfile
+import weakref
 from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -55,30 +57,47 @@ class ArtifactService:
         store: FileArtifactStore,
         *,
         maximum_bytes: int,
+        allowed_hosts: frozenset[str],
         client: httpx.AsyncClient | None = None,
     ) -> None:
         """Initialize the artifact service and its optional HTTP client."""
         self._database = database
         self._store = store
         self._maximum_bytes = maximum_bytes
+        self._allowed_hosts = allowed_hosts
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=True, timeout=60.0)
-        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = weakref.WeakValueDictionary()
 
     async def rewrite_urls(self, payload: SimplePayload, *, url_for: ArtifactUrl) -> SimplePayload:
         """Register upstream artifacts and rewrite cacheable URLs."""
-        await self._database.register_artifacts(payload)
         result = deepcopy(payload)
         files = result.get("files", [])
         if not isinstance(files, list):
             return result
+        registered: list[dict[str, Any]] = []
+        visible: list[Any] = []
         for file in files:
             if not isinstance(file, dict):
+                visible.append(file)
                 continue
             digest = _sha256(file)
             filename = file.get("filename")
-            if digest is not None and isinstance(filename, str) and _safe_filename(filename):
+            source_url = file.get("url")
+            if isinstance(source_url, str) and not _allowed_https_url(source_url, self._allowed_hosts):
+                continue
+            visible.append(file)
+            if (
+                digest is not None
+                and isinstance(filename, str)
+                and _safe_filename(filename)
+                and isinstance(source_url, str)
+                and _allowed_https_url(source_url, self._allowed_hosts)
+            ):
+                registered.append(deepcopy(file))
                 file["url"] = url_for(digest, filename)
+        result["files"] = visible
+        await self._database.register_artifacts({"files": registered})
         return result
 
     async def get_path(self, digest: str, filename: str) -> Path:
@@ -106,6 +125,8 @@ class ArtifactService:
             await self._client.aclose()
 
     async def _download(self, record: ArtifactRecord) -> Path:
+        if not _allowed_https_url(record.source_url, self._allowed_hosts):
+            raise ArtifactDownloadError("Artifact source is not allowed")
         if record.size is not None and record.size > self._maximum_bytes:
             raise ArtifactDownloadError("Artifact exceeds the configured size limit")
         self._store.root.mkdir(parents=True, exist_ok=True)
@@ -117,6 +138,8 @@ class ArtifactService:
             with os.fdopen(descriptor, "wb") as output:
                 async with self._client.stream("GET", record.source_url) as response:
                     response.raise_for_status()
+                    if not _allowed_https_url(str(response.url), self._allowed_hosts):
+                        raise ArtifactDownloadError("Artifact redirect target is not allowed")
                     async for chunk in response.aiter_bytes():
                         size += len(chunk)
                         if size > self._maximum_bytes:
@@ -145,3 +168,20 @@ def _sha256(file: dict[str, Any]) -> str | None:
 
 def _safe_filename(filename: str) -> bool:
     return bool(filename) and Path(filename).name == filename
+
+
+def _allowed_https_url(url: str, allowed_hosts: frozenset[str]) -> bool:
+    """Return whether an artifact URL is HTTPS on an explicitly allowed host."""
+    try:
+        target = urlsplit(url)
+        port = target.port
+    except ValueError:
+        return False
+    return (
+        target.scheme == "https"
+        and target.hostname is not None
+        and target.hostname.casefold() in allowed_hosts
+        and port in {None, 443}
+        and target.username is None
+        and target.password is None
+    )

@@ -49,6 +49,8 @@ class EdgeSettings:
 
     upstream_url: str
     minimum_age: timedelta
+    fallback_minimum_age: timedelta
+    allow_missing_upload_time: bool
     metadata_ttl: timedelta
     maximum_metadata_bytes: int
     maximum_artifact_bytes: int
@@ -63,6 +65,8 @@ class EdgeSettings:
         """Return the administrator-editable subset as primitive values."""
         return {
             "minimum_age_days": self.minimum_age.days,
+            "fallback_minimum_age_hours": int(self.fallback_minimum_age.total_seconds() // 3600),
+            "allow_missing_upload_time": self.allow_missing_upload_time,
             "metadata_ttl_seconds": int(self.metadata_ttl.total_seconds()),
             "maximum_artifact_bytes": self.maximum_artifact_bytes,
             "osv_enabled": self.osv_enabled,
@@ -75,6 +79,16 @@ class EdgeSettings:
         return replace(
             self,
             minimum_age=timedelta(days=_integer_value(values, "minimum_age_days", self.minimum_age.days)),
+            fallback_minimum_age=timedelta(
+                hours=_integer_value(
+                    values,
+                    "fallback_minimum_age_hours",
+                    int(self.fallback_minimum_age.total_seconds() // 3600),
+                )
+            ),
+            allow_missing_upload_time=_boolean_value(
+                values, "allow_missing_upload_time", self.allow_missing_upload_time
+            ),
             metadata_ttl=timedelta(
                 seconds=_integer_value(values, "metadata_ttl_seconds", int(self.metadata_ttl.total_seconds()))
             ),
@@ -107,6 +121,10 @@ class EdgeSettings:
         return cls(
             upstream_url=upstream_url.rstrip("/") + "/",
             minimum_age=timedelta(days=_positive_int(env.WHEELGUARD_MINIMUM_AGE_DAYS, "minimum age")),
+            fallback_minimum_age=timedelta(
+                hours=_positive_int(env.WHEELGUARD_FALLBACK_MINIMUM_AGE_HOURS, "fallback minimum age")
+            ),
+            allow_missing_upload_time=_boolean(env.WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME),
             metadata_ttl=timedelta(seconds=_positive_int(env.WHEELGUARD_METADATA_TTL_SECONDS, "metadata TTL")),
             maximum_metadata_bytes=_positive_int(env.WHEELGUARD_MAXIMUM_METADATA_BYTES, "metadata limit"),
             maximum_artifact_bytes=_positive_int(env.WHEELGUARD_MAXIMUM_ARTIFACT_BYTES, "artifact limit"),
@@ -129,11 +147,13 @@ class CloudflareRepository:
         self._env = env
         self._settings = EdgeSettings.from_env(env)
         token = getattr(env, "WHEELGUARD_AUTH_TOKEN", None)
-        self._authenticator = TokenAuthenticator(str(token) if token is not None else None)
+        try:
+            self._authenticator = TokenAuthenticator(str(token) if token is not None else None)
+        except ValueError as error:
+            raise RepositoryError(str(error)) from error
 
     async def fetch(self, request: Any) -> Response:
         """Route one repository request."""
-        await self._load_runtime_settings()
         if self._settings.require_authentication and not self._authenticator.enabled:
             return _error("Repository authentication is required but WHEELGUARD_AUTH_TOKEN is not configured", 503)
         if not self._authenticator.authorize(request.headers.get("authorization")):
@@ -142,6 +162,7 @@ class CloudflareRepository:
                 401,
                 {"WWW-Authenticate": 'Basic realm="wheelguard", charset="UTF-8"'},
             )
+        await self._load_runtime_settings()
         path = urlsplit(request.url).path
         if request.method not in {"GET", "HEAD"}:
             return _error("Method not allowed", 405, {"Allow": "GET, HEAD"})
@@ -217,14 +238,23 @@ class CloudflareRepository:
             advisories,
             now=now,
             minimum_age=self._settings.minimum_age,
+            fallback_minimum_age=self._settings.fallback_minimum_age,
         )
+        fallback_applied = bool(automatic_allows)
+        if fallback_applied:
+            _log("policy.vulnerability_fallback", project=project, versions=sorted(automatic_allows))
         overrides = await self._active_overrides(project, now)
         automatic_allows.update(overrides)
-        result = ReleasePolicy(self._settings.minimum_age).apply(payload, now=now, overrides=automatic_allows)
+        result = ReleasePolicy(
+            self._settings.minimum_age,
+            allow_missing_upload_time=self._settings.allow_missing_upload_time,
+        ).apply(payload, now=now, overrides=automatic_allows)
         rewritten = await self._register_and_rewrite(request, result.payload)
         headers = _simple_headers(media_type, cache_status)
         headers["X-Wheelguard-Advisories"] = advisory_status
         headers["X-Wheelguard-Hidden-Files"] = str(result.hidden_files)
+        if fallback_applied:
+            headers["X-Wheelguard-Policy"] += ", vulnerability-fallback"
         if last_serial:
             headers["X-PyPI-Last-Serial"] = last_serial
         if media_type == SIMPLE_JSON:
@@ -589,11 +619,18 @@ class CloudflareRepository:
 
     def _allowed_source(self, url: str) -> bool:
         """Return whether an artifact URL uses HTTPS on an allowlisted host."""
-        parsed = urlsplit(url)
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError:
+            return False
         return (
             parsed.scheme == "https"
             and parsed.hostname is not None
             and parsed.hostname.casefold() in self._settings.allowed_artifact_hosts
+            and port in {None, 443}
+            and parsed.username is None
+            and parsed.password is None
         )
 
     async def _artifact(self, request: Any, path: str) -> Response:
@@ -632,10 +669,11 @@ class CloudflareRepository:
             if stored is None:
                 return _error("Artifact cache write failed", 502)
         headers = {
-            "Cache-Control": "public, max-age=31536000, immutable",
+            "Cache-Control": "private, max-age=31536000, immutable",
             "Content-Length": str(stored.size),
             "Content-Type": "application/octet-stream",
             "ETag": str(stored.httpEtag),
+            "Vary": "Authorization",
             "X-Content-Type-Options": "nosniff",
             "X-Wheelguard-Artifact-Cache": cache_status,
         }
@@ -846,7 +884,10 @@ def _body_response(body: Any, request: Any, headers: dict[str, str]) -> Response
 
 def _redirect(location: str) -> Response:
     """Build a permanent canonical-path redirect."""
-    return Response(status=308, headers={"Location": location, "Cache-Control": "public, max-age=3600"})
+    return Response(
+        status=308,
+        headers={"Location": location, "Cache-Control": "private, max-age=3600", "Vary": "Authorization"},
+    )
 
 
 def _with_trailing_slash(url: str) -> str:
@@ -857,7 +898,12 @@ def _with_trailing_slash(url: str) -> str:
 
 def _error(message: str, status: int, extra_headers: dict[str, str] | None = None) -> Response:
     """Build a non-cacheable JSON error response."""
-    headers = {"Cache-Control": "no-store", "Content-Type": "application/json; charset=utf-8"}
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+        "Vary": "Authorization",
+        "X-Content-Type-Options": "nosniff",
+    }
     if extra_headers:
         headers.update(extra_headers)
     return Response.from_json({"detail": message}, status=status, headers=headers)

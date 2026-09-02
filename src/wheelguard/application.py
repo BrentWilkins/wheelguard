@@ -1,6 +1,7 @@
 """Create and configure the Wheelguard HTTP application."""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -24,10 +25,11 @@ from wheelguard.models import (
     ArtifactDownloadError,
     ArtifactNotFoundError,
     ProjectRepository,
+    SimplePayload,
     UpstreamNotFoundError,
     UpstreamRepositoryError,
 )
-from wheelguard.policy import MinimumAgePolicy
+from wheelguard.policy import ReleasePolicy, filename_version
 from wheelguard.refresh import AdvisoryRefresher
 from wheelguard.simple_api import (
     SIMPLE_HTML,
@@ -37,8 +39,10 @@ from wheelguard.simple_api import (
     render_root_html,
 )
 from wheelguard.upstream import PyPIRepository
+from wheelguard.vulnerabilities import automatic_fixed_version_allows
 
 Clock = Callable[[], datetime]
+LOGGER = logging.getLogger(__name__)
 
 
 def create_app(
@@ -65,8 +69,9 @@ def create_app(
         state,
         FileArtifactStore(configured.data_dir / "artifacts"),
         maximum_bytes=configured.maximum_artifact_bytes,
+        allowed_hosts=configured.allowed_artifact_hosts,
     )
-    policy = MinimumAgePolicy(
+    policy = ReleasePolicy(
         configured.minimum_age,
         allow_missing_upload_time=configured.allow_missing_upload_time,
     )
@@ -84,8 +89,8 @@ def create_app(
     refresher = AdvisoryRefresher(
         state,
         advisories,
-        policy,
         active_window=configured.advisory_active_window,
+        batch_size=configured.advisory_refresh_batch_size,
         clock=now,
     )
 
@@ -142,7 +147,7 @@ def create_app(
                 status_code=406,
             )
         names = await state.list_projects()
-        headers = {"Vary": "Accept"}
+        headers = {"Vary": "Accept, Authorization", "X-Content-Type-Options": "nosniff"}
         if content_type == SIMPLE_JSON:
             return JSONResponse(
                 {
@@ -175,17 +180,32 @@ def create_app(
         requested_at = now()
         if configured.osv_enabled:
             await state.record_advisory_target(normalized, requested_at=requested_at)
-        filtered = policy.apply(upstream.payload, now=requested_at)
-        evaluated = await advisories.apply(normalized, filtered.payload)
-        published = await artifacts.rewrite_urls(
+        evaluated = await advisories.apply(normalized, upstream.payload)
+        automatic_allows = automatic_fixed_version_allows(
             evaluated.payload,
+            _advisories_in(evaluated.payload),
+            now=requested_at,
+            minimum_age=configured.minimum_age,
+            fallback_minimum_age=configured.fallback_minimum_age,
+        )
+        if automatic_allows:
+            LOGGER.warning(
+                "policy.vulnerability_fallback project=%s versions=%s",
+                normalized,
+                sorted(automatic_allows),
+            )
+        filtered = policy.apply(evaluated.payload, now=requested_at, overrides=automatic_allows)
+        published = await artifacts.rewrite_urls(
+            filtered.payload,
             url_for=lambda digest, filename: str(request.url_for("artifact", digest=digest, filename=filename)),
         )
         headers = {
-            "Vary": "Accept",
+            "Vary": "Accept, Authorization",
+            "X-Content-Type-Options": "nosniff",
             "X-Wheelguard-Hidden-Files": str(filtered.hidden_files),
             "X-Wheelguard-Cache": upstream.cache_status,
             "X-Wheelguard-Advisories": (f"{evaluated.status}; vulnerable-files={evaluated.vulnerable_files}"),
+            "X-Wheelguard-Policy": "minimum-age, vulnerability-fallback" if automatic_allows else "minimum-age",
         }
         if upstream.last_serial is not None:
             headers["X-PyPI-Last-Serial"] = upstream.last_serial
@@ -205,10 +225,12 @@ def create_app(
             _read_file(path),
             media_type="application/octet-stream",
             headers={
-                "Cache-Control": "public, max-age=31536000, immutable",
+                "Cache-Control": "private, max-age=31536000, immutable",
                 "ETag": f'"sha256:{digest.casefold()}"',
                 "Content-Length": str(path.stat().st_size),
                 "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+                "Vary": "Authorization",
+                "X-Content-Type-Options": "nosniff",
             },
         )
 
@@ -222,3 +244,19 @@ async def _read_file(path: Path) -> AsyncIterator[bytes]:
     with path.open("rb") as source:
         while chunk := source.read(1024 * 1024):
             yield chunk
+
+
+def _advisories_in(payload: SimplePayload) -> dict[str, list[str]]:
+    """Recover Wheelguard advisory markers from an evaluated Simple API payload."""
+    advisories: dict[str, list[str]] = {}
+    files = payload.get("files", [])
+    if not isinstance(files, list):
+        return advisories
+    for file in files:
+        if not isinstance(file, dict):
+            continue
+        version = filename_version(file.get("filename"))
+        identifiers = file.get("wheelguard-advisories")
+        if version is not None and isinstance(identifiers, list):
+            advisories[str(version)] = [identifier for identifier in identifiers if isinstance(identifier, str)]
+    return advisories
