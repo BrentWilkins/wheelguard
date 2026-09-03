@@ -58,6 +58,49 @@ class RejectingDatabase:
         raise AssertionError("D1 was read before repository authentication")
 
 
+class ArtifactStatement:
+    """Return deterministic artifact-policy rows for Worker tests."""
+
+    def __init__(self, database: "ArtifactDatabase", query: str) -> None:
+        self.database = database
+        self.query = query
+
+    def bind(self, *_values: Any) -> "ArtifactStatement":
+        return self
+
+    async def first(self) -> Any:
+        if "FROM artifacts" in self.query:
+            return {
+                "source_url": "https://files.pythonhosted.org/demo.whl",
+                "size": 8,
+                "verification_sha256": "a" * 64,
+                "project": "demo",
+                "version": "1.0",
+            }
+        if "FROM advisory_scans" in self.query:
+            return {
+                "payload": json.dumps({"1.0": self.database.advisories}),
+                "checked_at": datetime.now(UTC).isoformat(),
+            }
+        raise AssertionError(f"Unexpected D1 first query: {self.query}")
+
+    async def raw(self) -> list[list[str]]:
+        if "FROM policy_overrides" not in self.query:
+            raise AssertionError(f"Unexpected D1 raw query: {self.query}")
+        return [["1.0", self.database.override]] if self.database.override is not None else []
+
+
+class ArtifactDatabase:
+    """Supply artifact identity, advisory state, and an optional admin override."""
+
+    def __init__(self, advisories: list[str], *, override: str | None = None) -> None:
+        self.advisories = advisories
+        self.override = override
+
+    def prepare(self, query: str) -> ArtifactStatement:
+        return ArtifactStatement(self, query)
+
+
 class Access:
     """Supply a local Cloudflare Access identity."""
 
@@ -127,7 +170,9 @@ async def test_cached_edge_artifact_is_private_and_varies_on_auth(
         async def get(self, _key: str) -> Any:
             return SimpleNamespace(size=8, httpEtag='"etag"', body=b"artifact")
 
-    repository = cloudflare_index.CloudflareRepository(_edge_env(WHEELGUARD_ARTIFACTS=Bucket()))
+    repository = cloudflare_index.CloudflareRepository(
+        _edge_env(WHEELGUARD_ARTIFACTS=Bucket(), WHEELGUARD_DB=ArtifactDatabase([]))
+    )
     response = await repository._artifact(
         FakeRequest("https://wheelguard.example/files/sha256/" + "a" * 64 + "/demo.whl"),
         "/files/sha256/" + "a" * 64 + "/demo.whl",
@@ -135,6 +180,62 @@ async def test_cached_edge_artifact_is_private_and_varies_on_auth(
     assert response.headers["cache-control"].startswith("private,")
     assert response.headers["vary"] == "Authorization"
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.anyio
+async def test_cached_vulnerable_edge_artifact_is_denied_before_r2_read(
+    worker_modules: tuple[Any, Any],
+) -> None:
+    """Apply current advisory policy even to bytes already cached in R2."""
+    _, cloudflare_index = worker_modules
+
+    class Bucket:
+        reads = 0
+
+        async def get(self, _key: str) -> Any:
+            self.reads += 1
+            return SimpleNamespace(size=8, httpEtag='"etag"', body=b"artifact")
+
+    bucket = Bucket()
+    repository = cloudflare_index.CloudflareRepository(
+        _edge_env(
+            WHEELGUARD_ARTIFACTS=bucket,
+            WHEELGUARD_DB=ArtifactDatabase(["GHSA-test"]),
+        )
+    )
+    response = await repository._artifact(
+        FakeRequest("https://wheelguard.example/files/sha256/" + "a" * 64 + "/demo.whl"),
+        "/files/sha256/" + "a" * 64 + "/demo.whl",
+    )
+
+    assert response.status == 403
+    assert response.headers["x-wheelguard-policy"] == "artifact-denied"
+    assert bucket.reads == 0
+
+
+@pytest.mark.anyio
+async def test_admin_allow_permits_vulnerable_edge_artifact(
+    worker_modules: tuple[Any, Any],
+) -> None:
+    """Treat the administrator interface as the explicit policy bypass."""
+    _, cloudflare_index = worker_modules
+
+    class Bucket:
+        async def get(self, _key: str) -> Any:
+            return SimpleNamespace(size=8, httpEtag='"etag"', body=b"artifact")
+
+    repository = cloudflare_index.CloudflareRepository(
+        _edge_env(
+            WHEELGUARD_ARTIFACTS=Bucket(),
+            WHEELGUARD_DB=ArtifactDatabase(["GHSA-test"], override="allow"),
+        )
+    )
+    response = await repository._artifact(
+        FakeRequest("https://wheelguard.example/files/sha256/" + "a" * 64 + "/demo.whl"),
+        "/files/sha256/" + "a" * 64 + "/demo.whl",
+    )
+
+    assert response.status == 200
 
 
 @pytest.mark.anyio
@@ -220,7 +321,7 @@ async def test_vulnerability_fallback_is_visible_in_headers_and_logs(
     async def overrides(_project: str, _now: datetime) -> dict[str, str]:
         return {}
 
-    async def rewrite(_request: Any, current: dict[str, Any]) -> dict[str, Any]:
+    async def rewrite(_request: Any, _project: str, current: dict[str, Any]) -> dict[str, Any]:
         return current
 
     repository._cached_project = cached

@@ -24,6 +24,7 @@ from wheelguard.models import (
     AdvisoryPolicy,
     ArtifactDownloadError,
     ArtifactNotFoundError,
+    ArtifactPolicyDeniedError,
     ProjectRepository,
     SimplePayload,
     UpstreamNotFoundError,
@@ -70,6 +71,8 @@ def create_app(
         FileArtifactStore(configured.data_dir / "artifacts"),
         maximum_bytes=configured.maximum_artifact_bytes,
         allowed_hosts=configured.allowed_artifact_hosts,
+        enforce_advisories=configured.osv_enabled,
+        advisory_ttl=configured.advisory_ttl,
     )
     policy = ReleasePolicy(
         configured.minimum_age,
@@ -120,8 +123,10 @@ def create_app(
                 if isawaitable(result):
                     await result
 
-    application = FastAPI(title="Wheelguard", version="0.1.0", lifespan=lifespan)
-    authenticator = TokenAuthenticator(configured.auth_token)
+    application = FastAPI(title="Wheelguard", version="0.2.0", lifespan=lifespan)
+    authenticator = TokenAuthenticator(
+        (*((configured.auth_token,) if configured.auth_token is not None else ()), *configured.auth_tokens)
+    )
 
     @application.middleware("http")
     async def authenticate_repository(request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -196,6 +201,7 @@ def create_app(
             )
         filtered = policy.apply(evaluated.payload, now=requested_at, overrides=automatic_allows)
         published = await artifacts.rewrite_urls(
+            normalized,
             filtered.payload,
             url_for=lambda digest, filename: str(request.url_for("artifact", digest=digest, filename=filename)),
         )
@@ -217,6 +223,15 @@ def create_app(
     async def artifact(digest: str, filename: str) -> Response:
         try:
             path = await artifacts.get_path(digest, filename)
+        except ArtifactPolicyDeniedError as error:
+            return JSONResponse(
+                {"detail": str(error)},
+                status_code=403,
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "X-Wheelguard-Policy": "artifact-denied",
+                },
+            )
         except ArtifactNotFoundError:
             return JSONResponse({"detail": "Artifact not found"}, status_code=404)
         except ArtifactDownloadError as error:

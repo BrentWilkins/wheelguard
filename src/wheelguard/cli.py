@@ -5,12 +5,18 @@ from ipaddress import ip_address
 
 import uvicorn
 
+from wheelguard.auth import configured_tokens
+
 
 def main() -> None:
     """Run Wheelguard's HTTP server."""
     host = os.getenv("WHEELGUARD_HOST", "127.0.0.1")
-    if not _loopback_host(host) and not os.getenv("WHEELGUARD_AUTH_TOKEN"):
-        raise SystemExit("WHEELGUARD_AUTH_TOKEN is required when listening on a non-loopback address")
+    if not _loopback_host(host) and not configured_tokens(
+        os.getenv("WHEELGUARD_AUTH_TOKEN"), os.getenv("WHEELGUARD_AUTH_TOKENS")
+    ):
+        raise SystemExit(
+            "WHEELGUARD_AUTH_TOKEN or WHEELGUARD_AUTH_TOKENS is required when listening on a non-loopback address"
+        )
     uvicorn.run(
         "wheelguard.application:app",
         host=host,

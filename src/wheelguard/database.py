@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from wheelguard.models import ArtifactRecord, ProjectResponse, SimplePayload
+from wheelguard.policy import filename_version
 
 _DATABASE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wheelguard-sqlite")
 
@@ -66,13 +67,15 @@ class Database:
                     last_serial TEXT,
                     fetched_at REAL NOT NULL
                 );
-            CREATE TABLE IF NOT EXISTS artifacts (
-                sha256 TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                source_url TEXT NOT NULL,
-                size INTEGER,
-                PRIMARY KEY (sha256, filename)
-            );
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    sha256 TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    size INTEGER,
+                    project TEXT,
+                    version TEXT,
+                    PRIMARY KEY (sha256, filename)
+                );
 
             CREATE TABLE IF NOT EXISTS advisory_scans (
                 project TEXT NOT NULL,
@@ -86,8 +89,14 @@ class Database:
                 project TEXT PRIMARY KEY,
                 requested_at REAL NOT NULL
             );
-            """
+                """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(artifacts)")}
+            if "project" not in columns:
+                connection.execute("ALTER TABLE artifacts ADD COLUMN project TEXT")
+            if "version" not in columns:
+                connection.execute("ALTER TABLE artifacts ADD COLUMN version TEXT")
+            connection.execute("CREATE INDEX IF NOT EXISTS artifacts_release_lookup ON artifacts (project, version)")
 
     @_database_io
     def get_project(self, normalized_name: str) -> CachedProject | None:
@@ -142,12 +151,12 @@ class Database:
             )
 
     @_database_io
-    def register_artifacts(self, payload: SimplePayload) -> None:
+    def register_artifacts(self, project: str, payload: SimplePayload) -> None:
         """Register artifact locations discovered in a Simple API payload."""
-        self._register_artifacts(payload)
+        self._register_artifacts(project, payload)
 
-    def _register_artifacts(self, payload: SimplePayload) -> None:
-        records = list(_artifact_records(payload))
+    def _register_artifacts(self, project: str, payload: SimplePayload) -> None:
+        records = list(_artifact_records(project, payload))
         if not records:
             return
         with sqlite3.connect(self._path) as connection:
@@ -157,13 +166,15 @@ class Database:
     def _write_artifacts(connection: sqlite3.Connection, records: list[ArtifactRecord]) -> None:
         connection.executemany(
             """
-            INSERT INTO artifacts (sha256, filename, source_url, size)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(sha256, filename) DO UPDATE SET
-                source_url = excluded.source_url,
-                size = excluded.size
+                INSERT INTO artifacts (sha256, filename, source_url, size, project, version)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sha256, filename) DO UPDATE SET
+                    source_url = excluded.source_url,
+                    size = excluded.size,
+                    project = excluded.project,
+                    version = excluded.version
             """,
-            [(r.sha256, r.filename, r.source_url, r.size) for r in records],
+            [(r.sha256, r.filename, r.source_url, r.size, r.project, r.version) for r in records],
         )
 
     @_database_io
@@ -175,14 +186,14 @@ class Database:
         with sqlite3.connect(self._path) as connection:
             row = connection.execute(
                 """
-                SELECT source_url, size FROM artifacts
+                SELECT source_url, size, project, version FROM artifacts
                 WHERE sha256 = ? AND filename = ?
                 """,
                 (sha256, filename),
             ).fetchone()
         if row is None:
             return None
-        return ArtifactRecord(sha256, filename, row[0], row[1])
+        return ArtifactRecord(sha256, filename, row[0], row[1], row[2], row[3])
 
     @_database_io
     def list_projects(self) -> list[str]:
@@ -258,6 +269,32 @@ class Database:
         return CachedAdvisories(advisories, datetime.fromtimestamp(row[1], tz=UTC))
 
     @_database_io
+    def get_latest_advisories(self, project: str) -> CachedAdvisories | None:
+        """Return the newest cached advisory mapping for a project."""
+        with sqlite3.connect(self._path) as connection:
+            row = connection.execute(
+                """
+                SELECT payload, checked_at
+                FROM advisory_scans
+                WHERE project = ?
+                ORDER BY checked_at DESC
+                LIMIT 1
+                """,
+                (project,),
+            ).fetchone()
+        if row is None:
+            return None
+        raw: Any = json.loads(row[0])
+        if not isinstance(raw, dict):
+            return None
+        advisories = {
+            version: [identifier for identifier in identifiers if isinstance(identifier, str)]
+            for version, identifiers in raw.items()
+            if isinstance(version, str) and isinstance(identifiers, list)
+        }
+        return CachedAdvisories(advisories, datetime.fromtimestamp(row[1], tz=UTC))
+
+    @_database_io
     def put_advisories(
         self,
         project: str,
@@ -281,7 +318,7 @@ class Database:
             )
 
 
-def _artifact_records(payload: SimplePayload) -> Iterator[ArtifactRecord]:
+def _artifact_records(project: str, payload: SimplePayload) -> Iterator[ArtifactRecord]:
     files = payload.get("files", [])
     if not isinstance(files, list):
         return
@@ -295,9 +332,12 @@ def _artifact_records(payload: SimplePayload) -> Iterator[ArtifactRecord]:
         size = file.get("size")
         if not isinstance(digest, str) or not isinstance(filename, str) or not isinstance(source_url, str):
             continue
+        version = filename_version(filename)
         yield ArtifactRecord(
             digest.casefold(),
             filename,
             source_url,
             size if isinstance(size, int) else None,
+            project,
+            str(version) if version is not None else None,
         )

@@ -23,7 +23,7 @@ currently use Python 3.13 through Pyodide.
 - Immutable local artifact URLs; unverified bytes are never served
 - Optional OSV batch evaluation with persistent, stale-tolerant scan caching
 - Periodic OSV refresh for projects requested within the active-use window
-- Vulnerable releases are yanked for normal resolution but remain available to exact pins
+- Vulnerable releases are yanked from resolution and denied at artifact download unless an administrator allows them
 - Optional Bearer and HTTP Basic authentication for repository routes
 
 The Cloudflare Worker serves authenticated PEP 503/691 project routes from D1 and stores hash-addressed artifacts and
@@ -32,7 +32,8 @@ sidecars are buffered and verified by Wheelguard before storage. A failed checks
 administrator allow/block overrides are applied on every project response. OSV is checked on the
 first request for a version set, cached in D1, and refreshed hourly for projects used within the last 30 days.
 
-Known-vulnerable releases remain addressable for exact pins but are marked as yanked, so normal resolution avoids them.
+Known-vulnerable releases are marked as yanked and denied even through an exact lock or previously issued artifact
+URL. An active administrator `allow` override is the deliberate bypass.
 If every release old enough to satisfy the cooldown is known vulnerable, Wheelguard temporarily admits the newest fresh
 non-vulnerable release. A manual block still wins over that automatic fallback.
 
@@ -287,7 +288,8 @@ unlocked Secret Service provider. In that case, use uv's user-local plaintext cr
 `UV_INDEX_WHEELGUARD_USERNAME` and `UV_INDEX_WHEELGUARD_PASSWORD` from a secret manager. The plaintext uv store is
 comparable to a carefully protected `.env` file, but it is shared by host rather than copied into each project.
 
-An exact pin to this known-vulnerable release remains installable, but uv surfaces Wheelguard's PEP 592 warning:
+An exact pin to this known-vulnerable release surfaces Wheelguard's PEP 592 warning, then the artifact request is
+denied with HTTP `403` unless an active administrator `allow` override exists:
 
 ```text
 warning: `idna==3.10` is yanked (reason: "Wheelguard advisories: GHSA-65pc-fj4g-8rjx, PYSEC-2026-215")
@@ -344,6 +346,22 @@ uv pip install \
 Plain HTTP is appropriate only for this localhost test; terminate TLS before Wheelguard in a real
 deployment.
 
+To give each user an independently revocable credential, keep your existing token in
+`WHEELGUARD_AUTH_TOKEN` and put additional tokens in the comma-separated
+`WHEELGUARD_AUTH_TOKENS` secret. Both variables are optional, but every configured token must
+contain at least 32 characters. For example:
+
+```shell
+WHEELGUARD_AUTH_TOKEN='your-existing-token-at-least-32-characters' \
+WHEELGUARD_AUTH_TOKENS='shared-token-at-least-32-characters' \
+uv run wheelguard
+```
+
+This also permits rotation without downtime: add the replacement token, update clients, verify
+they can authenticate, and only then remove the old token. On Cloudflare, store the complete
+comma-separated list as an encrypted secret with
+`uv run pywrangler secret put WHEELGUARD_AUTH_TOKENS`; do not add it to `wrangler.jsonc`.
+
 ## Configuration
 
 | Environment variable | Default | Purpose |
@@ -364,6 +382,7 @@ deployment.
 | `WHEELGUARD_ADVISORY_ACTIVE_DAYS` | `30` | Retain and periodically scan recently requested projects |
 | `WHEELGUARD_ADVISORY_REFRESH_BATCH_SIZE` | `25` | Maximum self-hosted projects scanned per periodic pass |
 | `WHEELGUARD_AUTH_TOKEN` | unset | Protect `/simple` and `/files` with a shared token |
+| `WHEELGUARD_AUTH_TOKENS` | unset | Comma-separated additional tokens for sharing and rotation |
 | `WHEELGUARD_ACCESS_AUD` | unset | Optional expected Cloudflare Access application audience for `/admin` |
 | `WHEELGUARD_HOST` | `127.0.0.1` | Listening host |
 | `WHEELGUARD_PORT` | `8000` | Listening port |

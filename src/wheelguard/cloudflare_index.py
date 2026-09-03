@@ -12,9 +12,9 @@ from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from packaging.utils import canonicalize_name
 from workers import Response, fetch
 
-from wheelguard.auth import TokenAuthenticator
+from wheelguard.auth import TokenAuthenticator, configured_tokens
 from wheelguard.models import SimplePayload
-from wheelguard.policy import ReleasePolicy
+from wheelguard.policy import ReleasePolicy, filename_version
 from wheelguard.runtime_settings import decode_stored_settings
 from wheelguard.simple_api import (
     SIMPLE_JSON,
@@ -149,15 +149,16 @@ class CloudflareRepository:
         self._env = env
         self._settings = EdgeSettings.from_env(env)
         token = getattr(env, "WHEELGUARD_AUTH_TOKEN", None)
+        tokens = getattr(env, "WHEELGUARD_AUTH_TOKENS", None)
         try:
-            self._authenticator = TokenAuthenticator(str(token) if token is not None else None)
+            self._authenticator = TokenAuthenticator(configured_tokens(token, tokens))
         except ValueError as error:
             raise RepositoryError(str(error)) from error
 
     async def fetch(self, request: Any) -> Response:
         """Route one repository request."""
         if self._settings.require_authentication and not self._authenticator.enabled:
-            return _error("Repository authentication is required but WHEELGUARD_AUTH_TOKEN is not configured", 503)
+            return _error("Repository authentication is required but no authentication tokens are configured", 503)
         if not self._authenticator.authorize(request.headers.get("authorization")):
             return _error(
                 "Authentication required",
@@ -251,7 +252,7 @@ class CloudflareRepository:
             self._settings.minimum_age,
             allow_missing_upload_time=self._settings.allow_missing_upload_time,
         ).apply(payload, now=now, overrides=automatic_allows)
-        rewritten = await self._register_and_rewrite(request, result.payload)
+        rewritten = await self._register_and_rewrite(request, project, result.payload)
         headers = _simple_headers(media_type, cache_status)
         headers["X-Wheelguard-Advisories"] = advisory_status
         headers["X-Wheelguard-Hidden-Files"] = str(result.hidden_files)
@@ -527,7 +528,7 @@ class CloudflareRepository:
         )
         return refreshed
 
-    async def _register_and_rewrite(self, request: Any, payload: SimplePayload) -> SimplePayload:
+    async def _register_and_rewrite(self, request: Any, project: str, payload: SimplePayload) -> SimplePayload:
         """Register safe artifacts in D1 and replace upstream URLs with cache URLs."""
         files = payload.get("files")
         if not isinstance(files, list):
@@ -554,6 +555,8 @@ class CloudflareRepository:
                     "source_url": source_url,
                     "size": size,
                     "verification_sha256": digest,
+                    "project": project,
+                    "version": str(version) if (version := filename_version(filename)) is not None else None,
                 }
             )
             metadata_digest = _metadata_sha256(file.get("core-metadata"))
@@ -567,6 +570,8 @@ class CloudflareRepository:
                         "source_url": _append_metadata(source_url),
                         "size": None,
                         "verification_sha256": metadata_digest,
+                        "project": project,
+                        "version": str(version) if version is not None else None,
                     }
                 )
         for start in range(0, len(records), 500):
@@ -579,19 +584,25 @@ class CloudflareRepository:
         await (
             self._env.WHEELGUARD_DB.prepare(
                 """
-            INSERT INTO artifacts (sha256, filename, source_url, size, verification_sha256)
-            SELECT
-                json_extract(value, '$.sha256'),
-                json_extract(value, '$.filename'),
-                json_extract(value, '$.source_url'),
-                json_extract(value, '$.size'),
-                json_extract(value, '$.verification_sha256')
+                INSERT INTO artifacts (
+                    sha256, filename, source_url, size, verification_sha256, project, version
+                )
+                SELECT
+                    json_extract(value, '$.sha256'),
+                    json_extract(value, '$.filename'),
+                    json_extract(value, '$.source_url'),
+                    json_extract(value, '$.size'),
+                    json_extract(value, '$.verification_sha256'),
+                    json_extract(value, '$.project'),
+                    json_extract(value, '$.version')
             FROM json_each(?1)
             WHERE 1
             ON CONFLICT(sha256, filename) DO UPDATE SET
-                source_url = excluded.source_url,
-                size = excluded.size,
-                verification_sha256 = excluded.verification_sha256
+                    source_url = excluded.source_url,
+                    size = excluded.size,
+                    verification_sha256 = excluded.verification_sha256,
+                    project = excluded.project,
+                    version = excluded.version
             """
             )
             .bind(json.dumps(records, separators=(",", ":")))
@@ -645,22 +656,33 @@ class CloudflareRepository:
         if _SHA256.fullmatch(digest) is None or not filename or "/" in filename or "\\" in filename:
             return _error("Artifact not found", 404)
         key = f"sha256/{digest}/{filename}"
+        row = _python(
+            await self._env.WHEELGUARD_DB.prepare(
+                """
+                SELECT source_url, size, verification_sha256, project, version
+                FROM artifacts
+                WHERE sha256 = ?1 AND filename = ?2
+                """
+            )
+            .bind(digest, filename)
+            .first()
+        )
+        if not isinstance(row, dict):
+            return _error("Artifact not found", 404)
+        denial = await self._artifact_policy_denial(row, now=datetime.now(UTC))
+        if denial is not None:
+            _log("artifact.policy_denied", digest=digest, filename=filename, reason=denial)
+            return _error(
+                denial,
+                403,
+                {
+                    "Cache-Control": "private, no-store",
+                    "X-Wheelguard-Policy": "artifact-denied",
+                },
+            )
         cache_status = "HIT"
         stored = await self._env.WHEELGUARD_ARTIFACTS.get(key)
         if stored is None:
-            row = _python(
-                await self._env.WHEELGUARD_DB.prepare(
-                    """
-                    SELECT source_url, size, verification_sha256
-                    FROM artifacts
-                    WHERE sha256 = ?1 AND filename = ?2
-                    """
-                )
-                .bind(digest, filename)
-                .first()
-            )
-            if not isinstance(row, dict):
-                return _error("Artifact not found", 404)
             try:
                 await self._populate_artifact(key, filename, row)
             except RepositoryError as error:
@@ -680,6 +702,55 @@ class CloudflareRepository:
             "X-Wheelguard-Artifact-Cache": cache_status,
         }
         return _body_response(stored.body, request, headers)
+
+    async def _artifact_policy_denial(self, row: dict[str, Any], *, now: datetime) -> str | None:
+        """Return a fail-closed artifact denial unless policy explicitly permits it."""
+        project = row.get("project")
+        version = row.get("version")
+        if not isinstance(project, str) or not isinstance(version, str):
+            return "Artifact has no policy identity; refresh project metadata"
+
+        action = (await self._active_overrides(project, now)).get(version)
+        if action == "allow":
+            return None
+        if action == "block":
+            return "Artifact denied by an administrator policy block"
+        if not self._settings.osv_enabled:
+            return None
+
+        cached = _python(
+            await self._env.WHEELGUARD_DB.prepare(
+                """
+                SELECT payload, checked_at
+                FROM advisory_scans
+                WHERE project = ?1
+                ORDER BY checked_at DESC
+                LIMIT 1
+                """
+            )
+            .bind(project)
+            .first()
+        )
+        if (
+            not isinstance(cached, dict)
+            or not isinstance(cached.get("payload"), str)
+            or not isinstance(cached.get("checked_at"), str)
+        ):
+            return "Artifact has no current advisory evaluation"
+        try:
+            advisories = _advisory_mapping(json.loads(cached["payload"]))
+            checked_at = _datetime(cached["checked_at"])
+        except (ValueError, json.JSONDecodeError):
+            advisories = None
+            checked_at = None
+        if advisories is None or version not in advisories:
+            return "Artifact has no current advisory evaluation"
+        if checked_at is None or now - checked_at >= self._settings.advisory_ttl:
+            return "Artifact advisory evaluation is stale; refresh project metadata"
+        identifiers = advisories[version]
+        if identifiers:
+            return f"Artifact denied by Wheelguard advisories: {', '.join(identifiers)}"
+        return None
 
     async def _populate_artifact(
         self,

@@ -21,6 +21,15 @@ def test_accepts_bearer_and_basic_password_tokens() -> None:
     assert authenticator.authorize(f"Basic {basic}")
 
 
+def test_accepts_any_configured_token() -> None:
+    replacement = "replacement-horse-battery-staple-token"
+    authenticator = TokenAuthenticator((TOKEN, replacement))
+
+    assert authenticator.authorize(f"Bearer {TOKEN}")
+    assert authenticator.authorize(f"Bearer {replacement}")
+    assert not authenticator.authorize("Bearer unconfigured-horse-battery-staple-token")
+
+
 def test_rejects_missing_malformed_and_incorrect_credentials() -> None:
     authenticator = TokenAuthenticator(TOKEN)
     incorrect = base64.b64encode(b"wheelguard:wrong").decode()

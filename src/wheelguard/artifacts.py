@@ -9,6 +9,7 @@ import weakref
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -19,6 +20,7 @@ from wheelguard.database import Database
 from wheelguard.models import (
     ArtifactDownloadError,
     ArtifactNotFoundError,
+    ArtifactPolicyDeniedError,
     ArtifactRecord,
     SimplePayload,
 )
@@ -61,6 +63,8 @@ class ArtifactService:
         *,
         maximum_bytes: int,
         allowed_hosts: frozenset[str],
+        enforce_advisories: bool = False,
+        advisory_ttl: timedelta = timedelta(hours=6),
         client: httpx.AsyncClient | None = None,
     ) -> None:
         """Initialize the artifact service and its optional HTTP client."""
@@ -68,11 +72,13 @@ class ArtifactService:
         self._store = store
         self._maximum_bytes = maximum_bytes
         self._allowed_hosts = allowed_hosts
+        self._enforce_advisories = enforce_advisories
+        self._advisory_ttl = advisory_ttl
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=False, timeout=60.0)
         self._locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = weakref.WeakValueDictionary()
 
-    async def rewrite_urls(self, payload: SimplePayload, *, url_for: ArtifactUrl) -> SimplePayload:
+    async def rewrite_urls(self, project: str, payload: SimplePayload, *, url_for: ArtifactUrl) -> SimplePayload:
         """Register upstream artifacts and rewrite cacheable URLs."""
         result = deepcopy(payload)
         files = result.get("files", [])
@@ -100,7 +106,7 @@ class ArtifactService:
                 registered.append(deepcopy(file))
                 file["url"] = url_for(digest, filename)
         result["files"] = visible
-        await self._database.register_artifacts({"files": registered})
+        await self._database.register_artifacts(project, {"files": registered})
         return result
 
     async def get_path(self, digest: str, filename: str) -> Path:
@@ -111,6 +117,8 @@ class ArtifactService:
         record = await self._database.get_artifact(digest, filename)
         if record is None:
             raise ArtifactNotFoundError(filename)
+        if self._enforce_advisories:
+            await self._authorize(record)
         cached = self._store.path(record)
         if cached.is_file():
             return cached
@@ -121,6 +129,19 @@ class ArtifactService:
             if cached.is_file():
                 return cached
             return await self._download(record)
+
+    async def _authorize(self, record: ArtifactRecord) -> None:
+        """Deny artifacts whose current project release is unsafe or unknown."""
+        if record.project is None or record.version is None:
+            raise ArtifactPolicyDeniedError("Artifact has no policy identity; refresh project metadata")
+        cached = await self._database.get_latest_advisories(record.project)
+        if cached is None or record.version not in cached.advisories:
+            raise ArtifactPolicyDeniedError("Artifact has no current advisory evaluation")
+        if datetime.now(UTC) - cached.checked_at >= self._advisory_ttl:
+            raise ArtifactPolicyDeniedError("Artifact advisory evaluation is stale; refresh project metadata")
+        identifiers = cached.advisories[record.version]
+        if identifiers:
+            raise ArtifactPolicyDeniedError(f"Artifact denied by Wheelguard advisories: {', '.join(identifiers)}")
 
     async def aclose(self) -> None:
         """Close the owned HTTP client."""

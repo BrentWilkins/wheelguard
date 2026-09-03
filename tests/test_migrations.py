@@ -12,6 +12,7 @@ def test_policy_audit_is_append_only(tmp_path: Path) -> None:
     migrations = Path("migrations")
     connection.executescript((migrations / "0001_cloudflare.sql").read_text())
     connection.executescript((migrations / "0002_immutable_policy_audit.sql").read_text())
+    connection.executescript((migrations / "0003_artifact_policy_identity.sql").read_text())
     connection.execute(
         """
         INSERT INTO policy_audit (id, event_type, actor, occurred_at, override_id, details)
@@ -22,3 +23,15 @@ def test_policy_audit_is_append_only(tmp_path: Path) -> None:
         connection.execute("UPDATE policy_audit SET actor = 'attacker' WHERE id = 'audit-1'")
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         connection.execute("DELETE FROM policy_audit WHERE id = 'audit-1'")
+
+
+def test_artifacts_are_associated_with_release_policy(tmp_path: Path) -> None:
+    """Record project and version so immutable URLs can be reevaluated."""
+    connection = sqlite3.connect(tmp_path / "schema.db")
+    migrations = Path("migrations")
+    connection.executescript((migrations / "0001_cloudflare.sql").read_text())
+    connection.executescript((migrations / "0002_immutable_policy_audit.sql").read_text())
+    connection.executescript((migrations / "0003_artifact_policy_identity.sql").read_text())
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(artifacts)")}
+    assert {"project", "version"} <= columns

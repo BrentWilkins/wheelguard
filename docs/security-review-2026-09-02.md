@@ -172,7 +172,7 @@ for `minimum_age_days`, so disabling the cooldown requires a redeploy rather tha
 ```python
 origin = request.headers.get("origin")
 if origin is None:
-    return None      # allowed
+    return None  # allowed
 ```
 
 Today this is not an open hole: POST and PATCH require `Content-Type: application/json`

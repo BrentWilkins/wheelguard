@@ -22,6 +22,12 @@ def test_missing_upload_timestamps_fail_closed_by_default() -> None:
     assert Settings().allow_missing_upload_time is False
 
 
+def test_loads_additional_authentication_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WHEELGUARD_AUTH_TOKENS", f"{'a' * 32}, {'b' * 32}")
+
+    assert Settings.from_environment().auth_tokens == ("a" * 32, "b" * 32)
+
+
 def test_rejects_insecure_upstream_and_empty_artifact_allowlist() -> None:
     """Keep self-hosted network destinations explicit and encrypted."""
     with pytest.raises(ValueError, match="HTTPS URL"):

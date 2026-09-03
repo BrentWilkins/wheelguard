@@ -1,5 +1,5 @@
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -7,7 +7,7 @@ import pytest
 
 from wheelguard.artifacts import ArtifactService, FileArtifactStore
 from wheelguard.database import Database
-from wheelguard.models import ArtifactDownloadError, ProjectResponse
+from wheelguard.models import ArtifactDownloadError, ArtifactPolicyDeniedError, ProjectResponse
 
 
 @pytest.fixture
@@ -48,6 +48,7 @@ async def test_downloads_verifies_and_reuses_artifact(tmp_path: Path) -> None:
             ],
         }
         rewritten = await service.rewrite_urls(
+            "demo",
             payload,
             url_for=lambda sha256, filename: f"/files/{sha256}/{filename}",
         )
@@ -79,6 +80,7 @@ async def test_rejects_hash_mismatch(tmp_path: Path) -> None:
             client=client,
         )
         await service.rewrite_urls(
+            "demo",
             {
                 "files": [
                     {
@@ -115,7 +117,7 @@ async def test_does_not_register_or_rewrite_untrusted_artifact_hosts(tmp_path: P
             }
         ]
     }
-    rewritten = await service.rewrite_urls(payload, url_for=lambda sha256, filename: f"/{sha256}/{filename}")
+    rewritten = await service.rewrite_urls("demo", payload, url_for=lambda sha256, filename: f"/{sha256}/{filename}")
     assert rewritten["files"] == []
     assert await database.get_artifact(digest, "demo.whl") is None
     await service.aclose()
@@ -145,6 +147,7 @@ async def test_rejects_redirects_to_untrusted_hosts(tmp_path: Path) -> None:
             client=client,
         )
         await service.rewrite_urls(
+            "demo",
             {
                 "files": [
                     {
@@ -201,6 +204,7 @@ async def test_rejects_untrusted_legacy_record_before_network_access(tmp_path: P
     database = Database(tmp_path / "wheelguard.db")
     await database.initialize()
     await database.register_artifacts(
+        "demo",
         {
             "files": [
                 {
@@ -209,7 +213,7 @@ async def test_rejects_untrusted_legacy_record_before_network_access(tmp_path: P
                     "hashes": {"sha256": digest},
                 }
             ]
-        }
+        },
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         service = ArtifactService(
@@ -222,3 +226,120 @@ async def test_rejects_untrusted_legacy_record_before_network_access(tmp_path: P
         with pytest.raises(ArtifactDownloadError, match="source is not allowed"):
             await service.get_path(digest, "demo.whl")
     assert requests == 0
+
+
+@pytest.mark.anyio
+async def test_denies_vulnerable_artifact_even_when_cached(tmp_path: Path) -> None:
+    """Reevaluate immutable cached bytes against fresh advisory policy."""
+    content = b"previously trusted artifact"
+    digest = hashlib.sha256(content).hexdigest()
+    filename = "demo-1.0-py3-none-any.whl"
+    database = Database(tmp_path / "wheelguard.db")
+    await database.initialize()
+    await database.register_artifacts(
+        "demo",
+        {
+            "files": [
+                {
+                    "filename": filename,
+                    "url": "https://files.example/demo.whl",
+                    "hashes": {"sha256": digest},
+                }
+            ]
+        },
+    )
+    await database.put_advisories("demo", "versions", {"1.0": ["GHSA-test"]}, checked_at=datetime.now(UTC))
+    store = FileArtifactStore(tmp_path / "artifacts")
+    record = await database.get_artifact(digest, filename)
+    assert record is not None
+    cached = store.path(record)
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(content)
+    service = ArtifactService(
+        database,
+        store,
+        maximum_bytes=1024,
+        allowed_hosts=frozenset({"files.example"}),
+        enforce_advisories=True,
+    )
+
+    with pytest.raises(ArtifactPolicyDeniedError, match="GHSA-test"):
+        await service.get_path(digest, filename)
+    await service.aclose()
+
+
+@pytest.mark.anyio
+async def test_allows_artifact_with_fresh_clean_evaluation(tmp_path: Path) -> None:
+    """Serve an artifact only when its release has a fresh clean evaluation."""
+    content = b"clean artifact"
+    digest = hashlib.sha256(content).hexdigest()
+    filename = "demo-1.0-py3-none-any.whl"
+    database = Database(tmp_path / "wheelguard.db")
+    await database.initialize()
+    await database.register_artifacts(
+        "demo",
+        {
+            "files": [
+                {
+                    "filename": filename,
+                    "url": "https://files.example/demo.whl",
+                    "hashes": {"sha256": digest},
+                }
+            ]
+        },
+    )
+    await database.put_advisories("demo", "versions", {"1.0": []}, checked_at=datetime.now(UTC))
+    store = FileArtifactStore(tmp_path / "artifacts")
+    record = await database.get_artifact(digest, filename)
+    assert record is not None
+    cached = store.path(record)
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(content)
+    service = ArtifactService(
+        database,
+        store,
+        maximum_bytes=1024,
+        allowed_hosts=frozenset({"files.example"}),
+        enforce_advisories=True,
+    )
+
+    assert await service.get_path(digest, filename) == cached
+    await service.aclose()
+
+
+@pytest.mark.anyio
+async def test_denies_artifact_when_clean_evaluation_is_stale(tmp_path: Path) -> None:
+    """Do not let an old clean result authorize a newly vulnerable release."""
+    digest = hashlib.sha256(b"artifact").hexdigest()
+    filename = "demo-1.0-py3-none-any.whl"
+    database = Database(tmp_path / "wheelguard.db")
+    await database.initialize()
+    await database.register_artifacts(
+        "demo",
+        {
+            "files": [
+                {
+                    "filename": filename,
+                    "url": "https://files.example/demo.whl",
+                    "hashes": {"sha256": digest},
+                }
+            ]
+        },
+    )
+    await database.put_advisories(
+        "demo",
+        "versions",
+        {"1.0": []},
+        checked_at=datetime.now(UTC) - timedelta(hours=7),
+    )
+    service = ArtifactService(
+        database,
+        FileArtifactStore(tmp_path / "artifacts"),
+        maximum_bytes=1024,
+        allowed_hosts=frozenset({"files.example"}),
+        enforce_advisories=True,
+    )
+
+    with pytest.raises(ArtifactPolicyDeniedError, match="stale"):
+        await service.get_path(digest, filename)
+    await service.aclose()

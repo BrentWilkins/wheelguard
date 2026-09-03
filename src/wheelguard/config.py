@@ -42,6 +42,7 @@ class Settings:
     advisory_active_window: timedelta = timedelta(days=30)
     advisory_refresh_batch_size: int = 25
     auth_token: str | None = None
+    auth_tokens: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Reject unsafe remote endpoints and empty artifact allowlists."""
@@ -80,4 +81,7 @@ class Settings:
             advisory_active_window=timedelta(days=_integer("WHEELGUARD_ADVISORY_ACTIVE_DAYS", "30")),
             advisory_refresh_batch_size=_integer("WHEELGUARD_ADVISORY_REFRESH_BATCH_SIZE", "25"),
             auth_token=os.getenv("WHEELGUARD_AUTH_TOKEN") or None,
+            auth_tokens=tuple(
+                token.strip() for token in os.getenv("WHEELGUARD_AUTH_TOKENS", "").split(",") if token.strip()
+            ),
         )

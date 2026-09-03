@@ -11,6 +11,7 @@ def test_refuses_unauthenticated_non_loopback_bind(monkeypatch: pytest.MonkeyPat
     """Fail closed instead of exposing an open repository from a container."""
     monkeypatch.setenv("WHEELGUARD_HOST", "0.0.0.0")
     monkeypatch.delenv("WHEELGUARD_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("WHEELGUARD_AUTH_TOKENS", raising=False)
     with pytest.raises(SystemExit, match="WHEELGUARD_AUTH_TOKEN"):
         cli.main()
 
@@ -20,6 +21,19 @@ def test_allows_unauthenticated_loopback_bind(monkeypatch: pytest.MonkeyPatch) -
     called: dict[str, Any] = {}
     monkeypatch.setenv("WHEELGUARD_HOST", "127.0.0.1")
     monkeypatch.delenv("WHEELGUARD_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("WHEELGUARD_AUTH_TOKENS", raising=False)
     monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: called.update(kwargs))
     cli.main()
     assert called["host"] == "127.0.0.1"
+
+
+def test_allows_non_loopback_bind_with_token_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: dict[str, Any] = {}
+    monkeypatch.setenv("WHEELGUARD_HOST", "0.0.0.0")
+    monkeypatch.delenv("WHEELGUARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("WHEELGUARD_AUTH_TOKENS", "s" * 32)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: called.update(kwargs))
+
+    cli.main()
+
+    assert called["host"] == "0.0.0.0"

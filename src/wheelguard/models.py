@@ -39,6 +39,8 @@ class ArtifactRecord:
     filename: str
     source_url: str
     size: int | None = None
+    project: str | None = None
+    version: str | None = None
 
 
 class ArtifactNotFoundError(Exception):
@@ -47,6 +49,10 @@ class ArtifactNotFoundError(Exception):
 
 class ArtifactDownloadError(Exception):
     """Indicate that an artifact could not be downloaded or verified."""
+
+
+class ArtifactPolicyDeniedError(Exception):
+    """Indicate current policy denies access to an artifact."""
 
 
 @dataclass(frozen=True, slots=True)
