@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib
+import sqlite3
 import sys
 from http import HTTPMethod
 from types import ModuleType, SimpleNamespace
@@ -117,3 +118,67 @@ async def test_rejects_untrusted_redirect_before_worker_fetch(monkeypatch: pytes
     with pytest.raises(module.RepositoryError, match="redirect target"):
         await repository._fetch_artifact("https://files.pythonhosted.org/packages/demo.whl")
     assert requests == ["https://files.pythonhosted.org/packages/demo.whl"]
+
+
+@pytest.mark.anyio
+async def test_artifact_registration_does_not_rewrite_identical_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep cached project requests from consuming one D1 write per artifact."""
+    module = _cloudflare_index(monkeypatch)
+    database = sqlite3.connect(":memory:")
+    database.executescript(
+        """
+        CREATE TABLE artifacts (
+            sha256 TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            size INTEGER,
+            verification_sha256 TEXT,
+            project TEXT,
+            version TEXT,
+            PRIMARY KEY (sha256, filename)
+        );
+        """
+    )
+
+    class Statement:
+        def __init__(self, query: str) -> None:
+            self.query = query
+            self.values: tuple[Any, ...] = ()
+
+        def bind(self, *values: Any) -> "Statement":
+            self.values = values
+            return self
+
+        async def run(self) -> None:
+            database.execute(self.query, self.values)
+
+    class Database:
+        def prepare(self, query: str) -> Statement:
+            return Statement(query)
+
+    repository = module.CloudflareRepository.__new__(module.CloudflareRepository)
+    repository._env = SimpleNamespace(WHEELGUARD_DB=Database())
+    records = [
+        {
+            "sha256": "a" * 64,
+            "filename": "demo-1.0-py3-none-any.whl.metadata",
+            "source_url": "https://files.pythonhosted.org/demo.whl.metadata",
+            "size": None,
+            "verification_sha256": "b" * 64,
+            "project": "demo",
+            "version": "1.0",
+        }
+    ]
+
+    before = database.total_changes
+    await repository._register_artifact_records(records)
+    assert database.total_changes - before == 1
+
+    before = database.total_changes
+    await repository._register_artifact_records(records)
+    assert database.total_changes - before == 0
+
+    records[0]["source_url"] = "https://files.pythonhosted.org/replaced.whl.metadata"
+    before = database.total_changes
+    await repository._register_artifact_records(records)
+    assert database.total_changes - before == 1

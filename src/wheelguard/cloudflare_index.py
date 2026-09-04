@@ -603,7 +603,12 @@ class CloudflareRepository:
                     verification_sha256 = excluded.verification_sha256,
                     project = excluded.project,
                     version = excluded.version
-            """
+                WHERE artifacts.source_url IS NOT excluded.source_url
+                   OR artifacts.size IS NOT excluded.size
+                   OR artifacts.verification_sha256 IS NOT excluded.verification_sha256
+                   OR artifacts.project IS NOT excluded.project
+                   OR artifacts.version IS NOT excluded.version
+                """
             )
             .bind(json.dumps(records, separators=(",", ":")))
             .run()
