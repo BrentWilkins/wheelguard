@@ -123,7 +123,7 @@ def create_app(
                 if isawaitable(result):
                     await result
 
-    application = FastAPI(title="Wheelguard", version="0.2.0", lifespan=lifespan)
+    application = FastAPI(title="Wheelguard", version="0.2.1", lifespan=lifespan)
     authenticator = TokenAuthenticator(
         (*((configured.auth_token,) if configured.auth_token is not None else ()), *configured.auth_tokens)
     )
@@ -199,7 +199,12 @@ def create_app(
                 normalized,
                 sorted(automatic_allows),
             )
-        filtered = policy.apply(evaluated.payload, now=requested_at, overrides=automatic_allows)
+        filtered = policy.apply(
+            evaluated.payload,
+            now=requested_at,
+            overrides=automatic_allows,
+            fallback_minimum_age=configured.fallback_minimum_age,
+        )
         published = await artifacts.rewrite_urls(
             normalized,
             filtered.payload,

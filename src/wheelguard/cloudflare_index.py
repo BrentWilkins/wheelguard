@@ -251,7 +251,7 @@ class CloudflareRepository:
         result = ReleasePolicy(
             self._settings.minimum_age,
             allow_missing_upload_time=self._settings.allow_missing_upload_time,
-        ).apply(payload, now=now, overrides=automatic_allows)
+        ).apply(payload, now=now, overrides=automatic_allows, fallback_minimum_age=self._settings.fallback_minimum_age)
         rewritten = await self._register_and_rewrite(request, project, result.payload)
         headers = _simple_headers(media_type, cache_status)
         headers["X-Wheelguard-Advisories"] = advisory_status
@@ -664,7 +664,7 @@ class CloudflareRepository:
         row = _python(
             await self._env.WHEELGUARD_DB.prepare(
                 """
-                SELECT source_url, size, verification_sha256, project, version
+                SELECT sha256, filename, source_url, size, verification_sha256, project, version
                 FROM artifacts
                 WHERE sha256 = ?1 AND filename = ?2
                 """
@@ -721,7 +721,7 @@ class CloudflareRepository:
         if action == "block":
             return "Artifact denied by an administrator policy block"
         if not self._settings.osv_enabled:
-            return None
+            return await self._artifact_age_denial(row, {}, now=now)
 
         cached = _python(
             await self._env.WHEELGUARD_DB.prepare(
@@ -755,7 +755,49 @@ class CloudflareRepository:
         identifiers = advisories[version]
         if identifiers:
             return f"Artifact denied by Wheelguard advisories: {', '.join(identifiers)}"
-        return None
+        return await self._artifact_age_denial(row, advisories, now=now)
+
+    async def _artifact_age_denial(
+        self, row: dict[str, Any], advisories: dict[str, list[str]], *, now: datetime
+    ) -> str | None:
+        """Recheck the exact artifact against persisted publication metadata."""
+        cached = await self._cached_project(row["project"])
+        if cached is None:
+            return "Artifact has no publication metadata; refresh project metadata"
+        payload = cached[0]
+        fallback = automatic_fixed_version_allows(
+            payload,
+            advisories,
+            now=now,
+            minimum_age=self._settings.minimum_age,
+            fallback_minimum_age=self._settings.fallback_minimum_age,
+        )
+        eligible = (
+            ReleasePolicy(
+                self._settings.minimum_age,
+                allow_missing_upload_time=self._settings.allow_missing_upload_time,
+            )
+            .apply(
+                payload,
+                now=now,
+                overrides=fallback,
+                fallback_minimum_age=self._settings.fallback_minimum_age,
+            )
+            .payload
+        )
+        filename = row.get("filename", "")
+        sidecar = filename.endswith(".metadata")
+        parent = filename.removesuffix(".metadata") if sidecar else filename
+        for file in eligible.get("files", []):
+            if not isinstance(file, dict) or file.get("filename") != parent:
+                continue
+            hashes = file.get("hashes", {})
+            if not isinstance(hashes, dict) or hashes.get("sha256") != row.get("sha256"):
+                continue
+            if sidecar and _metadata_sha256(file.get("core-metadata")) != row.get("verification_sha256"):
+                continue
+            return None
+        return "Artifact denied by current publication-age policy"
 
     async def _populate_artifact(
         self,

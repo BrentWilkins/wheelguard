@@ -114,7 +114,7 @@ def automatic_fixed_version_allows(
     if aged_safe or not fresh_safe:
         return {}
     newest = max(fresh_safe)
-    return {str(newest): "allow"}
+    return {str(newest): "fallback"}
 
 
 def _upload_time(value: object) -> datetime | None:

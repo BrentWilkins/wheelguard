@@ -81,6 +81,7 @@ class ReleasePolicy:
         *,
         now: datetime,
         overrides: dict[str, str] | None = None,
+        fallback_minimum_age: timedelta | None = None,
     ) -> PolicyResult:
         """Filter release files, with explicit blocks winning and allows bypassing age."""
         if now.tzinfo is None:
@@ -106,7 +107,13 @@ class ReleasePolicy:
                 continue
             uploaded = _upload_time(file.get("upload-time"))
             age_allows = self.allow_missing_upload_time if uploaded is None else uploaded <= cutoff
-            if action == "allow" or age_allows:
+            fallback_allows = (
+                action == "fallback"
+                and fallback_minimum_age is not None
+                and uploaded is not None
+                and uploaded <= now.astimezone(UTC) - fallback_minimum_age
+            )
+            if action == "allow" or age_allows or fallback_allows:
                 visible.append(file)
                 if version is not None:
                     visible_versions.add(version)

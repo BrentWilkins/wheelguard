@@ -34,7 +34,7 @@ def test_known_vulnerability_is_yanked_and_fresh_fix_is_allowed() -> None:
     )
 
     assert marked["files"][0]["yanked"] == "Wheelguard advisories: GHSA-test"
-    assert allows == {"2.0": "allow"}
+    assert allows == {"2.0": "fallback"}
 
 
 def test_fresh_release_is_not_needed_when_an_aged_safe_release_exists() -> None:
@@ -69,3 +69,26 @@ def test_fixed_release_younger_than_fallback_floor_is_not_allowed() -> None:
 def test_osv_result_count_must_match_queries() -> None:
     with pytest.raises(InvalidOsvResponseError, match="result count"):
         parse_osv_results({"results": []}, ["1.0"])
+
+
+def test_fallback_checks_each_file_age() -> None:
+    """An older source archive must not admit a newly uploaded wheel."""
+    from wheelguard.policy import ReleasePolicy
+
+    payload = _payload()
+    payload["files"].append({"filename": "demo-2.0-py3-none-any.whl", "upload-time": "2026-08-31T23:59:00Z"})
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    fallback = automatic_fixed_version_allows(
+        payload,
+        {"1.0": ["GHSA-test"], "2.0": []},
+        now=now,
+        minimum_age=timedelta(days=14),
+        fallback_minimum_age=timedelta(hours=24),
+    )
+    result = ReleasePolicy(timedelta(days=14)).apply(
+        payload,
+        now=now,
+        overrides=fallback,
+        fallback_minimum_age=timedelta(hours=24),
+    )
+    assert [file["filename"] for file in result.payload["files"]] == ["demo-1.0.tar.gz", "demo-2.0.tar.gz"]

@@ -88,14 +88,12 @@ class ArtifactService:
         visible: list[Any] = []
         for file in files:
             if not isinstance(file, dict):
-                visible.append(file)
                 continue
             digest = _sha256(file)
             filename = file.get("filename")
             source_url = file.get("url")
             if isinstance(source_url, str) and not _allowed_https_url(source_url, self._allowed_hosts):
                 continue
-            visible.append(file)
             if (
                 digest is not None
                 and isinstance(filename, str)
@@ -105,6 +103,7 @@ class ArtifactService:
             ):
                 registered.append(deepcopy(file))
                 file["url"] = url_for(digest, filename)
+                visible.append(file)
         result["files"] = visible
         await self._database.register_artifacts(project, {"files": registered})
         return result

@@ -343,3 +343,34 @@ async def test_denies_artifact_when_clean_evaluation_is_stale(tmp_path: Path) ->
     with pytest.raises(ArtifactPolicyDeniedError, match="stale"):
         await service.get_path(digest, filename)
     await service.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("hashes", [{"sha512": "a" * 128}, {"sha256": "invalid"}, {}])
+async def test_hides_unverifiable_artifacts(tmp_path: Path, hashes: dict[str, str]) -> None:
+    """Never publish an upstream URL that bypasses artifact authorization."""
+    database = Database(tmp_path / "wheelguard.db")
+    await database.initialize()
+    async with httpx.AsyncClient() as client:
+        service = ArtifactService(
+            database,
+            FileArtifactStore(tmp_path / "artifacts"),
+            maximum_bytes=1024,
+            allowed_hosts=frozenset({"files.example"}),
+            client=client,
+        )
+        result = await service.rewrite_urls(
+            "demo",
+            {
+                "files": [
+                    {
+                        "filename": "demo-1.0.tar.gz",
+                        "url": "https://files.example/demo.tar.gz",
+                        "hashes": hashes,
+                        "yanked": "Known vulnerability",
+                    }
+                ]
+            },
+            url_for=lambda digest, filename: f"/files/{digest}/{filename}",
+        )
+        assert result["files"] == []

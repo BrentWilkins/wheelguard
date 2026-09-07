@@ -2,6 +2,16 @@
 
 All notable changes to Wheelguard are documented here.
 
+## 0.2.1 - 2026-09-07
+
+### Security
+
+- Apply the automatic vulnerability fallback cooldown to each artifact so an older source archive cannot admit a newly uploaded wheel.
+- Recheck publication age and current fallback eligibility for direct Worker downloads after an administrator allow expires or is revoked. Metadata sidecars receive the same checks; missing publication metadata denies access.
+- Hide self-hosted artifacts without a valid SHA-256 or a supported proxy URL so downloads cannot bypass authorization and verification.
+
+No database migration is required.
+
 ## 0.2.0 - 2026-09-03
 
 ### Added

@@ -71,11 +71,29 @@ class ArtifactStatement:
     async def first(self) -> Any:
         if "FROM artifacts" in self.query:
             return {
+                "sha256": "a" * 64,
+                "filename": "demo-1.0.tar.gz",
                 "source_url": "https://files.pythonhosted.org/demo.whl",
                 "size": 8,
                 "verification_sha256": "a" * 64,
                 "project": "demo",
                 "version": "1.0",
+            }
+        if "FROM projects" in self.query:
+            return {
+                "payload": json.dumps(
+                    {
+                        "files": [
+                            {
+                                "filename": "demo-1.0.tar.gz",
+                                "hashes": {"sha256": "a" * 64},
+                                "upload-time": "2020-01-01T00:00:00Z",
+                            }
+                        ]
+                    }
+                ),
+                "last_serial": None,
+                "fetched_at": datetime.now(UTC).isoformat(),
             }
         if "FROM advisory_scans" in self.query:
             return {

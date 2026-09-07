@@ -182,3 +182,51 @@ async def test_artifact_registration_does_not_rewrite_identical_rows(monkeypatch
     before = database.total_changes
     await repository._register_artifact_records(records)
     assert database.total_changes - before == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("sidecar", [False, True])
+@pytest.mark.parametrize("osv_enabled", [False, True])
+async def test_download_rechecks_age_after_allow_removed(
+    monkeypatch: pytest.MonkeyPatch, sidecar: bool, osv_enabled: bool
+) -> None:
+    """Previously issued URLs lose their age exemption when the allow ends."""
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import AsyncMock
+
+    module = _cloudflare_index(monkeypatch)
+    repository = object.__new__(module.CloudflareRepository)
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    repository._settings = SimpleNamespace(
+        osv_enabled=osv_enabled,
+        minimum_age=timedelta(days=14),
+        fallback_minimum_age=timedelta(hours=24),
+        allow_missing_upload_time=False,
+        advisory_ttl=timedelta(hours=6),
+    )
+    statement = SimpleNamespace()
+    statement.bind = lambda *args: statement
+    statement.first = AsyncMock(return_value={"payload": '{"1.0":[]}', "checked_at": now.isoformat()})
+    repository._env = SimpleNamespace(WHEELGUARD_DB=SimpleNamespace(prepare=lambda sql: statement))
+    repository._active_overrides = AsyncMock(return_value={"1.0": "allow"})
+    file = {
+        "filename": "demo-1.0.tar.gz",
+        "hashes": {"sha256": "a" * 64},
+        "core-metadata": {"sha256": "b" * 64},
+        "upload-time": (now - timedelta(minutes=1)).isoformat(),
+    }
+    repository._cached_project = AsyncMock(return_value=({"files": [file]}, None, now))
+    row = {
+        "project": "demo",
+        "version": "1.0",
+        "sha256": "a" * 64,
+        "filename": file["filename"] + (".metadata" if sidecar else ""),
+        "verification_sha256": ("b" if sidecar else "a") * 64,
+    }
+    assert await repository._artifact_policy_denial(row, now=now) is None
+    repository._active_overrides.return_value = {}
+    assert "publication-age" in await repository._artifact_policy_denial(row, now=now)
+    file["upload-time"] = (now - timedelta(days=14)).isoformat()
+    assert await repository._artifact_policy_denial(row, now=now) is None
+    repository._cached_project.return_value = None
+    assert "publication metadata" in await repository._artifact_policy_denial(row, now=now)

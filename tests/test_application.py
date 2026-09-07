@@ -30,6 +30,7 @@ class FakeRepository:
                     {
                         "filename": "demo_package-2.0-py3-none-any.whl",
                         "url": "https://files.example/new.whl",
+                        "hashes": {"sha256": "b" * 64},
                         "upload-time": "2026-08-25T00:00:00Z",
                     },
                 ],
