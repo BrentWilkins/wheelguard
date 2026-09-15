@@ -37,6 +37,78 @@ URL. An active administrator `allow` override is the deliberate bypass.
 If every release old enough to satisfy the cooldown is known vulnerable, Wheelguard temporarily admits the newest fresh
 non-vulnerable release. A manual block still wins over that automatic fallback.
 
+## Private publishing (Cloudflare)
+
+The Cloudflare service accepts wheels and source distributions through the standard
+PyPI multipart upload protocol at `/upload/`. Private projects appear in the same
+authenticated `/simple/` index used for proxied packages.
+
+Before deploying this feature, apply the D1 migrations. Then configure a **separate**
+publisher secret, at least 32 characters long, through Wrangler's secret prompt:
+
+```shell
+uv run pywrangler d1 migrations apply wheelguard --remote
+uv run pywrangler secret put WHEELGUARD_UPLOAD_TOKEN
+```
+
+Publishing is disabled when that secret is unset. Existing repository tokens grant
+read access only; the publisher token does not automatically grant download access.
+For local development, set the publisher secret in the ignored `.dev.vars` file.
+
+Build the package and publish with uv:
+
+```shell
+uv build
+# Supply UV_PUBLISH_TOKEN through your secret manager or CI secret environment.
+uv publish --publish-url https://wheelguard.example/upload/
+```
+
+Alternatively, set `TWINE_USERNAME=__token__` and supply `TWINE_PASSWORD` through
+your secret environment, then run:
+
+```shell
+twine upload --repository-url https://wheelguard.example/upload/ dist/*
+```
+
+Replace `wheelguard.example` with your service hostname. Install using your existing
+read credential and the `/simple/` index. Do not configure uv's optional publish
+`--check-url` with the publisher token: that endpoint requires a read credential.
+
+### Public name collisions
+
+The first upload checks the normalized project name on PyPI and, when different,
+the configured upstream. An existing public name causes a `409` response with a
+link to **Administration → Private packages**. An Access-authenticated administrator
+must click **Acknowledge and permit hiding all upstream releases**; then retry the
+upload. Approval is audited and does not take ownership until publishing succeeds.
+An unavailable or inconclusive public lookup returns `503`; retry later.
+
+Once claimed, a private name exposes **only private releases**, including when the
+private release set is empty or blocked. Old upstream artifact URLs are denied by
+the server. Client-side copies already downloaded cannot be recalled. Later uploads
+do not require repeated approval, and the administrator UI keeps the collision warning.
+
+### Private release behavior and limits
+
+- Private releases are available immediately, without the public-package cooldown
+  or PyPI OSV lookup. Administrator allow/block overrides still apply.
+- Upload exactly one file per request. Wheels, `.tar.gz`, and `.zip` source
+  distributions must contain matching embedded core metadata. Uploaded code is
+  never executed by Wheelguard.
+- The configured artifact-size limit applies while streaming, even without a
+  `Content-Length` header. Multipart fields, embedded metadata, and ZIP central
+  directories are each limited to 1 MiB. ZIP64 directories and attestations are
+  not supported. Source archive inspection stops at the smaller of 1 GiB or
+  100 times compressed size (with a 1 MiB floor).
+- Re-uploading identical bytes under the same filename succeeds. Different bytes
+  for an existing filename return `409`; publish a new version instead.
+- Verified bytes are stored before the catalog is committed. Failed uploads are
+  aborted or removed where their outcome is known. An interrupted request or lost
+  database response can leave an unreferenced R2 object; cleanup is intentionally
+  conservative so a committed artifact is never deleted by a failed retry.
+- Package deletion, releasing private names, and local/container publishing are
+  outside this release.
+
 ## Development
 
 ```shell

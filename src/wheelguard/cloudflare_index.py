@@ -157,6 +157,10 @@ class CloudflareRepository:
 
     async def fetch(self, request: Any) -> Response:
         """Route one repository request."""
+        from wheelguard.private_packages import PrivatePackages
+
+        if urlsplit(request.url).path in {"/upload", "/upload/"}:
+            return await PrivatePackages(self).upload(request)
         if self._settings.require_authentication and not self._authenticator.enabled:
             return _error("Repository authentication is required but no authentication tokens are configured", 503)
         if not self._authenticator.authorize(request.headers.get("authorization")):
@@ -182,6 +186,11 @@ class CloudflareRepository:
             return await self._project(request, canonicalize_name(project))
         if path.startswith("/files/sha256/"):
             return await self._artifact(request, path)
+        if path.startswith("/files/private/sha256/"):
+            components = path.removeprefix("/files/private/sha256/").split("/", 1)
+            if len(components) != 2 or not _SHA256.fullmatch(components[0]):
+                return _error("Artifact not found", 404)
+            return await PrivatePackages(self).artifact(request, components[0], unquote(components[1]))
         return _error("Not found", 404)
 
     async def _load_runtime_settings(self) -> None:
@@ -199,7 +208,8 @@ class CloudflareRepository:
         if media_type is None:
             return _error("No acceptable Simple API representation", 406)
         raw = await self._env.WHEELGUARD_DB.prepare(
-            "SELECT normalized_name FROM projects ORDER BY normalized_name"
+            "SELECT normalized_name FROM projects UNION "
+            "SELECT normalized_name FROM private_projects WHERE claimed_at IS NOT NULL ORDER BY normalized_name"
         ).raw()
         projects = [str(row[0]) for row in _python(raw) if row]
         headers = _simple_headers(media_type, "D1")
@@ -213,6 +223,11 @@ class CloudflareRepository:
 
     async def _project(self, request: Any, project: str) -> Response:
         """Fetch, filter, register, and render one project's metadata."""
+        from wheelguard.private_packages import PrivatePackages
+
+        private = PrivatePackages(self)
+        if await private.owns(project):
+            return await private.listing(request, project)
         media_type = negotiate_content_type(request.headers.get("accept"))
         if media_type is None:
             return _error("No acceptable Simple API representation", 406)
@@ -497,8 +512,10 @@ class CloudflareRepository:
                 """
             SELECT targets.project
             FROM advisory_targets AS targets
-            JOIN projects ON projects.normalized_name = targets.project
-            WHERE targets.requested_at >= ?1
+                JOIN projects ON projects.normalized_name = targets.project
+                WHERE targets.requested_at >= ?1
+                    AND NOT EXISTS (SELECT 1 FROM private_projects
+                        WHERE normalized_name = targets.project AND claimed_at IS NOT NULL)
             ORDER BY COALESCE(
                 (SELECT MAX(checked_at) FROM advisory_scans WHERE project = targets.project),
                 ''
@@ -710,10 +727,14 @@ class CloudflareRepository:
 
     async def _artifact_policy_denial(self, row: dict[str, Any], *, now: datetime) -> str | None:
         """Return a fail-closed artifact denial unless policy explicitly permits it."""
+        from wheelguard.private_packages import PrivatePackages
+
         project = row.get("project")
         version = row.get("version")
         if not isinstance(project, str) or not isinstance(version, str):
             return "Artifact has no policy identity; refresh project metadata"
+        if await PrivatePackages(self).owns(project):
+            return "Upstream artifact denied because this name is privately owned"
 
         action = (await self._active_overrides(project, now)).get(version)
         if action == "allow":

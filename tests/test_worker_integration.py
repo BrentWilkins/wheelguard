@@ -3,7 +3,7 @@
 import importlib
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -69,6 +69,8 @@ class ArtifactStatement:
         return self
 
     async def first(self) -> Any:
+        if "FROM private_projects" in self.query:
+            return None
         if "FROM artifacts" in self.query:
             return {
                 "sha256": "a" * 64,
@@ -140,6 +142,7 @@ def worker_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
     monkeypatch.setitem(sys.modules, "workers", workers)
     sys.modules.pop("wheelguard.cloudflare_index", None)
     sys.modules.pop("wheelguard.worker", None)
+    sys.modules.pop("wheelguard.private_packages", None)
     cloudflare_index = importlib.import_module("wheelguard.cloudflare_index")
     worker = importlib.import_module("wheelguard.worker")
     return worker, cloudflare_index
@@ -318,10 +321,11 @@ async def test_vulnerability_fallback_is_visible_in_headers_and_logs(
     settings = cloudflare_index.EdgeSettings.from_env(_edge_env())
     repository = cloudflare_index.CloudflareRepository.__new__(cloudflare_index.CloudflareRepository)
     repository._settings = settings
+    repository._env = _edge_env(WHEELGUARD_DB=ArtifactDatabase([]), WHEELGUARD_ARTIFACTS=None)
     payload = {
         "files": [
-            {"filename": "demo-1.0.tar.gz", "upload-time": "2026-01-01T00:00:00Z"},
-            {"filename": "demo-2.0.tar.gz", "upload-time": "2026-08-30T00:00:00Z"},
+            {"filename": "demo-1.0.tar.gz", "upload-time": (datetime.now(UTC) - timedelta(days=30)).isoformat()},
+            {"filename": "demo-2.0.tar.gz", "upload-time": (datetime.now(UTC) - timedelta(days=2)).isoformat()},
         ]
     }
 

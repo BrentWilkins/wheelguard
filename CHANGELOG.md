@@ -2,6 +2,21 @@
 
 All notable changes to Wheelguard are documented here.
 
+## Unreleased
+
+### Added
+
+- Accept private wheel and source-distribution uploads through the PyPI legacy multipart protocol at `/upload/`, compatible with `uv publish` and Twine.
+- Require a separate `WHEELGUARD_UPLOAD_TOKEN`; repository credentials remain read-only.
+- Serve privately owned names exclusively from private artifacts, immediately and without the public release cooldown or PyPI OSV lookup.
+- Add administrator approval and audit records before a private name can shadow an existing PyPI or configured-upstream project.
+
+### Security
+
+- Stream uploads into R2 with digest, size, filename, upload-field, and embedded metadata checks before publishing catalog entries.
+- Prevent private artifact replacement, public fallback for private names, and reuse of prior upstream artifact URLs after a private name is claimed.
+- Require D1 migration `0004_private_packages.sql` before deploying this release. Publishing remains disabled until `WHEELGUARD_UPLOAD_TOKEN` is configured.
+
 ## 0.2.1 - 2026-09-07
 
 ### Security

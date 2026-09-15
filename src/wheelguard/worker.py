@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from packaging.utils import canonicalize_name
 from workers import Response, WorkerEntrypoint
 
 from wheelguard.admin import InvalidOverrideError, admin_content_security_policy, parse_override_request
@@ -33,11 +34,21 @@ class Default(WorkerEntrypoint):
     async def fetch(self, request: Any) -> Response:
         """Route repository, health, and administrator requests."""
         path = urlsplit(request.url).path
-        if path == "/simple" or path.startswith("/simple/") or path.startswith("/files/"):
+        if path in {"/simple", "/upload", "/upload/"} or path.startswith(("/simple/", "/files/")):
             try:
                 return await CloudflareRepository(self.env).fetch(request)
             except RepositoryError as error:
                 return _error(str(error), 503)
+        if path == "/admin/api/private-projects" or path.startswith("/admin/api/private-projects/"):
+            actor = await self._admin_actor()
+            if actor is None:
+                return _error("Cloudflare Access authentication required", 403)
+            if path == "/admin/api/private-projects" and request.method == "GET":
+                return await self._list_private_projects()
+            if path.endswith("/approve") and request.method == "POST":
+                name = path.removeprefix("/admin/api/private-projects/").removesuffix("/approve")
+                return await self._approve_private_project(request, actor, name)
+            return _error("Method not allowed", 405)
         if path == "/healthz" and request.method == "GET":
             return Response.from_json({"status": "ok", "runtime": "cloudflare"})
         if path == "/admin" or path == "/admin/":
@@ -108,6 +119,69 @@ class Default(WorkerEntrypoint):
         identity = await access.getIdentity()
         email = getattr(identity, "email", None)
         return str(email) if email else "unknown-access-user"
+
+    async def _list_private_projects(self) -> Response:
+        """List pending approvals and existing private name ownership."""
+        from wheelguard.cloudflare_index import _python
+
+        rows = _python(
+            await self.env.WHEELGUARD_DB.prepare("""
+            SELECT normalized_name, collisions, approved_at, approved_by, claimed_at
+            FROM private_projects ORDER BY normalized_name
+        """).raw()
+        )
+        projects = [
+            {
+                "name": name,
+                "collisions": json.loads(collisions),
+                "approved_at": approved_at,
+                "approved_by": approved_by,
+                "claimed_at": claimed_at,
+            }
+            for name, collisions, approved_at, approved_by, claimed_at in rows
+        ]
+        return Response.from_json({"projects": projects}, headers=JSON_HEADERS)
+
+    async def _approve_private_project(self, request: Any, actor: str, name: str) -> Response:
+        """Audit an explicit acknowledgment before a public name can be claimed."""
+        from wheelguard.cloudflare_index import _python
+
+        rejected = _reject_cross_origin_write(request)
+        if rejected is not None:
+            return rejected
+        try:
+            if len(name) > 200 or canonicalize_name(name, validate=True) != name:
+                raise ValueError
+        except ValueError:
+            return _error("Invalid normalized project name", 422)
+        row = _python(
+            await self.env.WHEELGUARD_DB.prepare("SELECT collisions FROM private_projects WHERE normalized_name = ?1")
+            .bind(name)
+            .first()
+        )
+        if not isinstance(row, dict) or not json.loads(row["collisions"]):
+            return _error("No pending public name collision for this project", 404)
+        now = _now()
+        await self.env.WHEELGUARD_DB.batch(
+            [
+                self.env.WHEELGUARD_DB.prepare("""
+                INSERT INTO policy_audit (id, event_type, actor, occurred_at, details)
+                SELECT ?1, 'private.collision-approved', ?2, ?3, ?4 FROM private_projects
+                WHERE normalized_name = ?5 AND approved_at IS NULL
+            """).bind(
+                    str(uuid4()),
+                    actor,
+                    now,
+                    json.dumps({"project": name, "collisions": json.loads(row["collisions"])}),
+                    name,
+                ),
+                self.env.WHEELGUARD_DB.prepare("""
+                UPDATE private_projects SET approved_at = ?2, approved_by = ?3
+                WHERE normalized_name = ?1 AND approved_at IS NULL
+            """).bind(name, now, actor),
+            ]
+        )
+        return await self._list_private_projects()
 
     async def _list_overrides(self) -> Response:
         """Return active and historical overrides newest first."""
@@ -503,8 +577,14 @@ _ADMIN_HTML = """<!doctype html>
 </head>
 <body>
   <h1>Wheelguard administration</h1>
-  <p>Signed in through Cloudflare Access as <strong>{{ actor }}</strong>.</p>
-  <h2>Runtime policy settings</h2>
+<p>Signed in through Cloudflare Access as <strong>{{ actor }}</strong>.</p>
+<h2 id="private-packages">Private packages</h2>
+<p>Private ownership hides every upstream release for that name. Approve a public name collision only if
+you intend to replace that package in this repository, then retry publishing.</p>
+<button id="refresh-private" type="button">Refresh private packages</button>
+<p id="private-status" aria-live="polite"></p>
+<div id="private-projects"></div>
+<h2>Runtime policy settings</h2>
   <p>These values take effect on the next repository request. Resetting a value restores its deployment default.</p>
   <form id="settings"></form>
   <p>
@@ -766,7 +846,60 @@ _ADMIN_HTML = """<!doctype html>
         showStatus(status, error.message, 'error');
       }
     };
-    loadSettings().catch(error => { showStatus(settingsStatus, error.message, 'error'); });
+async function loadPrivateProjects() {
+  const status = document.querySelector('#private-status');
+  const container = document.querySelector('#private-projects');
+  try {
+    const {projects} = await requestJson('/admin/api/private-projects');
+    container.replaceChildren();
+    for (const project of projects) {
+      const card = document.createElement('section');
+      card.className = 'setting';
+      const heading = document.createElement('strong');
+      heading.textContent = project.name;
+      card.append(heading);
+      const state = document.createElement('span');
+      state.textContent = project.claimed_at ? 'Privately owned' :
+        project.approved_at ? 'Approved; retry publishing to claim this name' :
+        project.collisions.length ? 'Awaiting collision acknowledgment' : 'Upload incomplete; retry publishing';
+      card.append(state);
+      if (project.collisions.length) {
+        const warning = document.createElement('p');
+        warning.textContent = 'Warning: private ownership hides ALL upstream releases for this name.';
+        card.append(warning);
+        for (const url of project.collisions) {
+          const link = document.createElement('a');
+          link.href = url;
+          link.textContent = url;
+          link.rel = 'noreferrer';
+          card.append(link);
+        }
+        if (!project.approved_at && !project.claimed_at) {
+          const approve = document.createElement('button');
+          approve.type = 'button';
+          approve.textContent = 'Acknowledge and permit hiding all upstream releases';
+          approve.onclick = async () => {
+            approve.disabled = true;
+            try {
+              await requestJson(`/admin/api/private-projects/${encodeURIComponent(project.name)}/approve`,
+                {method: 'POST'});
+              await loadPrivateProjects();
+            } catch (error) {
+              showStatus(status, error.message, 'error');
+              approve.disabled = false;
+            }
+          };
+          card.append(approve);
+        }
+      }
+      container.append(card);
+    }
+    showStatus(status, projects.length ? '' : 'No private packages or pending collisions.');
+  } catch (error) { showStatus(status, error.message, 'error'); }
+}
+document.querySelector('#refresh-private').onclick = loadPrivateProjects;
+loadPrivateProjects();
+loadSettings().catch(error => { showStatus(settingsStatus, error.message, 'error'); });
     loadOverrides().catch(error => { showStatus(status, error.message, 'error'); });
   </script>
 </body>
