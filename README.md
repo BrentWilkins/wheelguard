@@ -155,6 +155,10 @@ digests are stored. Private publishing can use short-lived GitLab OIDC tokens
 when `WHEELGUARD_PUBLISHER_OIDC_ISSUER` and an explicit
 `WHEELGUARD_PUBLISHER_OIDC_PROJECTS` allowlist are configured.
 
+For a greenfield private-network deployment, see the
+[Azure deployment guide](docs/azure-deployment.md) and the reusable Terraform
+module under `infra/modules/azure`.
+
 ### Cloudflare development
 
 The Cloudflare entrypoint provides `/healthz`, authenticated repository routes under `/simple/` and `/files/`, and the
@@ -509,6 +513,8 @@ comma-separated list as an encrypted secret with
 | Environment variable | Default | Purpose |
 |---|---:|---|
 | `WHEELGUARD_UPSTREAM_URL` | `https://pypi.org/simple/` | Upstream Simple API |
+| `WHEELGUARD_PUBLIC_URL` | request origin | Canonical external origin used in generated artifact URLs |
+| `WHEELGUARD_DOCUMENTATION_URL` | unset | Optional user-guide link shown on the landing page |
 | `WHEELGUARD_MINIMUM_AGE_DAYS` | `14` | Minimum artifact age |
 | `WHEELGUARD_FALLBACK_MINIMUM_AGE_HOURS` | `24` | Minimum age before a fixed release may bypass the normal age policy |
 | `WHEELGUARD_ALLOW_MISSING_UPLOAD_TIME` | `false` | Fail closed when upload timestamps are missing or invalid |
@@ -525,6 +531,20 @@ comma-separated list as an encrypted secret with
 | `WHEELGUARD_ADVISORY_REFRESH_BATCH_SIZE` | `25` | Maximum self-hosted projects scanned per periodic pass |
 | `WHEELGUARD_AUTH_TOKEN` | unset | Protect `/simple` and `/files` with a shared token |
 | `WHEELGUARD_AUTH_TOKENS` | unset | Comma-separated additional tokens for sharing and rotation |
+| `WHEELGUARD_ADMIN_TOKEN` | unset | Temporary administrator token, separate from repository credentials |
+| `WHEELGUARD_ADMIN_TOKEN_ACTOR` | `temporary-admin` | Audit identity for temporary administrator-token actions |
+| `WHEELGUARD_MANAGED_TOKEN_AUTH_ENABLED` | `false` | Require PostgreSQL-backed repository tokens |
+| `WHEELGUARD_DATABASE_URL` | unset | Enable the PostgreSQL metadata backend |
+| `WHEELGUARD_DATABASE_TOKEN_SCOPE` | Azure PostgreSQL scope | Managed-identity token audience for PostgreSQL |
+| `WHEELGUARD_DATABASE_APP_PRINCIPAL` | unset | PostgreSQL application-principal name used by migrations |
+| `WHEELGUARD_DATABASE_APP_OBJECT_ID` | unset | Object ID paired with the application-principal name |
+| `WHEELGUARD_AZURE_STORAGE_ACCOUNT_URL` | unset | Enable the Azure Blob artifact backend |
+| `WHEELGUARD_AZURE_ARTIFACT_CONTAINER` | `artifacts` | Blob container for verified content-addressed objects |
+| `WHEELGUARD_PUBLISHER_OIDC_ISSUER` | unset | GitLab OIDC issuer accepted for private uploads |
+| `WHEELGUARD_PUBLISHER_OIDC_AUDIENCE` | `wheelguard-publisher` | Required publisher-token audience |
+| `WHEELGUARD_PUBLISHER_OIDC_PROJECTS` | unset | Comma-separated publishing project allowlist |
+| `WHEELGUARD_ENTRA_ADMIN_ENABLED` | `false` | Trust authenticated Entra headers on administrator routes |
+| `WHEELGUARD_TRUST_PRIVATE_INGRESS` | `false` | Allow credential-free reads only behind private ingress |
 | `WHEELGUARD_ACCESS_AUD` | unset | Optional expected Cloudflare Access application audience for `/admin` |
 | `WHEELGUARD_HOST` | `127.0.0.1` | Listening host |
 | `WHEELGUARD_PORT` | `8000` | Listening port |

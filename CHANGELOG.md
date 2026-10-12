@@ -6,6 +6,8 @@ All notable changes to Wheelguard are documented here.
 
 ### Added
 
+- Add a reusable, private-networked Azure Container Apps deployment with
+  PostgreSQL, Blob Storage, managed identities, and greenfield documentation.
 - Add optional PostgreSQL metadata and Azure Blob artifact backends with
   managed-identity authentication and schema migration commands.
 - Support short-lived GitLab OIDC publishing and individually managed,

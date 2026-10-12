@@ -84,6 +84,38 @@ jobs:
       - name: Validate Cloudflare Worker bundle
         run: uv run --frozen pywrangler deploy --dry-run
 
+  documentation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Build documentation
+        run: uvx --from zensical==0.0.64 zensical build --clean --strict
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.13.3
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive infra
+
+      - name: Initialize Terraform example
+        run: terraform -chdir=infra/examples/azure-government init -backend=false
+
+      - name: Validate Terraform example
+        run: terraform -chdir=infra/examples/azure-government validate
+
   container:
     runs-on: ubuntu-latest
     steps:

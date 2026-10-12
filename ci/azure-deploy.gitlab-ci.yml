@@ -1,0 +1,122 @@
+# Optional GitLab pipeline template for Azure Government deployments.
+# Include it only after configuring every required protected CI/CD variable.
+stages:
+  - build
+  - deploy
+
+default:
+  interruptible: true
+
+.azure-cli:
+  image: ghcr.io/astral-sh/uv:0.9.13-python3.12-bookworm-slim
+  variables:
+    AZURE_CLOUD_NAME: AzureUSGovernment
+    UV_TOOL_BIN_DIR: /usr/local/bin
+  before_script:
+    - ': "${AZURE_CLIENT_ID:?Configure AZURE_CLIENT_ID in GitLab CI/CD variables}"'
+    - ': "${AZURE_TENANT_ID:?Configure AZURE_TENANT_ID in GitLab CI/CD variables}"'
+    - ': "${AZURE_SUBSCRIPTION_ID:?Configure AZURE_SUBSCRIPTION_ID in GitLab CI/CD variables}"'
+    - ': "${AZURE_CLIENT_CERTIFICATE:?Configure AZURE_CLIENT_CERTIFICATE as a protected GitLab file variable}"'
+    - test -f "$AZURE_CLIENT_CERTIFICATE"
+    - chmod 600 "$AZURE_CLIENT_CERTIFICATE"
+    - uv tool install --python /usr/local/bin/python --prerelease=allow azure-cli==2.90.0
+    - az cloud set --name "$AZURE_CLOUD_NAME"
+    - export NO_PROXY="${NO_PROXY:+$NO_PROXY,}login.microsoftonline.us,management.usgovcloudapi.net,.azurecr.us,.blob.core.usgovcloudapi.net"
+    - export no_proxy="$NO_PROXY"
+    - >-
+      az login --service-principal --username "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID"
+      --certificate "$AZURE_CLIENT_CERTIFICATE" --output none
+    - az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+container:
+  stage: build
+  extends: .azure-cli
+  rules:
+    - if: $WHEELGUARD_AZURE_DEPLOY_ENABLED == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - ': "${WHEELGUARD_ACR_NAME:?Configure WHEELGUARD_ACR_NAME in GitLab CI/CD variables}"'
+    - ': "${WHEELGUARD_ACR_SERVER:?Configure WHEELGUARD_ACR_SERVER in GitLab CI/CD variables}"'
+    - ': "${WHEELGUARD_IMAGE:?Configure WHEELGUARD_IMAGE in GitLab CI/CD variables}"'
+    - az account list-locations --output none
+    - az acr show --name "$WHEELGUARD_ACR_NAME" --query name --output tsv >/dev/null
+    - WHEELGUARD_REPOSITORY="${WHEELGUARD_IMAGE#"$WHEELGUARD_ACR_SERVER"/}"
+    - test "$WHEELGUARD_REPOSITORY" != "$WHEELGUARD_IMAGE"
+    - WHEELGUARD_ACR_QUEUE_LOG="$(mktemp)"
+    - >-
+      az acr build --registry "$WHEELGUARD_ACR_NAME"
+      --image "$WHEELGUARD_REPOSITORY:$CI_COMMIT_SHA" --no-wait
+      --output none . 2>&1 | tee "$WHEELGUARD_ACR_QUEUE_LOG"
+    - >-
+      WHEELGUARD_ACR_RUN_ID="$(sed -n
+      's/^WARNING: Queued a build with ID: \([^[:space:]]*\).*$/\1/p'
+      "$WHEELGUARD_ACR_QUEUE_LOG" | tail -n 1)"
+    - test -n "$WHEELGUARD_ACR_RUN_ID"
+    - >-
+      az acr task logs --registry "$WHEELGUARD_ACR_NAME"
+      --run-id "$WHEELGUARD_ACR_RUN_ID"
+    - |
+      WHEELGUARD_DIGEST=""
+      for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        WHEELGUARD_DIGEST="$(az acr task show-run --registry "$WHEELGUARD_ACR_NAME" \
+          --run-id "$WHEELGUARD_ACR_RUN_ID" \
+          --query 'outputImages[0].digest' --output tsv)"
+        if test -n "$WHEELGUARD_DIGEST"; then
+          break
+        fi
+        echo "Waiting for ACR to publish the image digest (attempt $attempt/12)..."
+        sleep 5
+      done
+    - test -n "$WHEELGUARD_DIGEST"
+    - printf 'WHEELGUARD_DEPLOY_IMAGE=%s@%s\n' "$WHEELGUARD_IMAGE" "$WHEELGUARD_DIGEST" > build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+deploy:
+  stage: deploy
+  extends: .azure-cli
+  resource_group: wheelguard-deployment
+  rules:
+    - if: $WHEELGUARD_AZURE_DEPLOY_ENABLED == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - ': "${WHEELGUARD_RESOURCE_GROUP:?Configure WHEELGUARD_RESOURCE_GROUP in GitLab CI/CD variables}"'
+    - ': "${WHEELGUARD_SCHEMA_JOB:?Configure WHEELGUARD_SCHEMA_JOB in GitLab CI/CD variables}"'
+    - ': "${WHEELGUARD_REFRESH_JOB:?Configure WHEELGUARD_REFRESH_JOB in GitLab CI/CD variables}"'
+    - ': "${WHEELGUARD_CONTAINER_APP:?Configure WHEELGUARD_CONTAINER_APP in GitLab CI/CD variables}"'
+    - >-
+      az containerapp job update --resource-group "$WHEELGUARD_RESOURCE_GROUP"
+      --name "$WHEELGUARD_SCHEMA_JOB" --image "$WHEELGUARD_DEPLOY_IMAGE" --output none
+    - ./scripts/run-azure-schema-upgrade.sh
+    - >-
+      az containerapp job update --resource-group "$WHEELGUARD_RESOURCE_GROUP"
+      --name "$WHEELGUARD_REFRESH_JOB" --image "$WHEELGUARD_DEPLOY_IMAGE" --output none
+    - >-
+      az containerapp update --resource-group "$WHEELGUARD_RESOURCE_GROUP"
+      --name "$WHEELGUARD_CONTAINER_APP" --image "$WHEELGUARD_DEPLOY_IMAGE" --output none
+    - |
+      for attempt in $(seq 1 60); do
+        WHEELGUARD_LATEST_REVISION="$(az containerapp show \
+          --resource-group "$WHEELGUARD_RESOURCE_GROUP" \
+          --name "$WHEELGUARD_CONTAINER_APP" \
+          --query properties.latestRevisionName --output tsv)"
+        WHEELGUARD_READY_REVISION="$(az containerapp show \
+          --resource-group "$WHEELGUARD_RESOURCE_GROUP" \
+          --name "$WHEELGUARD_CONTAINER_APP" \
+          --query properties.latestReadyRevisionName --output tsv)"
+        WHEELGUARD_HEALTH_STATE="$(az containerapp revision show \
+          --resource-group "$WHEELGUARD_RESOURCE_GROUP" \
+          --name "$WHEELGUARD_CONTAINER_APP" \
+          --revision "$WHEELGUARD_LATEST_REVISION" \
+          --query properties.healthState --output tsv 2>/dev/null || true)"
+        if test "$WHEELGUARD_LATEST_REVISION" = "$WHEELGUARD_READY_REVISION" \
+          && test "$WHEELGUARD_HEALTH_STATE" = "Healthy"; then
+          echo "Revision $WHEELGUARD_LATEST_REVISION is ready and healthy."
+          exit 0
+        fi
+        echo "Waiting for revision readiness (attempt $attempt/60): latest=$WHEELGUARD_LATEST_REVISION ready=$WHEELGUARD_READY_REVISION health=$WHEELGUARD_HEALTH_STATE"
+        sleep 5
+      done
+      echo "The latest Container App revision did not become ready and healthy." >&2
+      exit 1

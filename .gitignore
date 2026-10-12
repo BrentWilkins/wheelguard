@@ -11,6 +11,8 @@
 .venv/
 .wrangler/
 .terraform/
+site/
+public/
 *.tfvars
 *.tfvars.json
 !*.tfvars.example
