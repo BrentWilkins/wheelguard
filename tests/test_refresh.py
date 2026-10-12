@@ -63,4 +63,26 @@ async def test_advisory_target_batch_is_bounded(tmp_path: Path) -> None:
     for index in range(5):
         await database.record_advisory_target(f"project-{index}", requested_at=now + timedelta(seconds=index))
     targets = await database.list_advisory_targets(requested_since=now - timedelta(days=1), limit=2)
-    assert targets == ["project-4", "project-3"]
+    assert targets == ["project-0", "project-1"]
+
+
+@pytest.mark.anyio
+async def test_advisory_target_batches_do_not_starve_unscanned_projects(tmp_path: Path) -> None:
+    """Move evaluated projects behind unscanned targets across bounded passes."""
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    database = Database(tmp_path / "wheelguard.db")
+    await database.initialize()
+    for index in range(5):
+        await database.record_advisory_target(f"project-{index}", requested_at=now + timedelta(seconds=index))
+
+    first = await database.list_advisory_targets(requested_since=now - timedelta(days=1), limit=2)
+    for project in first:
+        await database.put_advisories(project, "versions", {}, checked_at=now)
+    second = await database.list_advisory_targets(requested_since=now - timedelta(days=1), limit=2)
+    for project in second:
+        await database.put_advisories(project, "versions", {}, checked_at=now)
+    third = await database.list_advisory_targets(requested_since=now - timedelta(days=1), limit=2)
+
+    assert first == ["project-0", "project-1"]
+    assert second == ["project-2", "project-3"]
+    assert third[0] == "project-4"

@@ -1,0 +1,13 @@
+# Include this file from Python projects that install from WheelGuard.
+# Pin the include to a reviewed WheelGuard tag or commit.
+wheelguard:preflight:
+  stage: .pre
+  script:
+    - ': "${WHEELGUARD_INDEX_URL:?Configure the private WheelGuard simple-index URL}"'
+    - ': "${WHEELGUARD_PREFLIGHT_SCRIPT_URL:?Configure the matching WheelGuard preflight-script URL}"'
+    - >-
+      uv run --no-project --no-config "$WHEELGUARD_PREFLIGHT_SCRIPT_URL"
+      --lock uv.lock --index-url "$WHEELGUARD_INDEX_URL"
+  rules:
+    - exists:
+        - uv.lock

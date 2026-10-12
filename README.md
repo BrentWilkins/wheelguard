@@ -346,6 +346,55 @@ to advisories have both a `yanked` reason and a `wheelguard-advisories` list. Wh
 Wheelguard records successful project requests and periodically refreshes advisories for projects
 used within the active window. The first request remains protected by the synchronous check.
 
+For a clean locked CI install, warm the complete registry dependency set before `uv sync`. The command reads only
+registry package names and versions from `uv.lock`; Wheelguard resolves URLs, hashes, and policy identities from its own
+cached or upstream Simple metadata. Supply the normal repository credential through a masked CI variable:
+
+```shell
+uv run --no-project --no-config https://packages.example.com/tools/preflight.py \
+  --lock uv.lock --index-url https://packages.example.com/simple/
+uv sync --locked --group dev
+```
+
+`uv` remains the package client. It temporarily downloads and runs this standard-library-only preflight helper from the
+same Wheelguard deployment before the package installation begins. The helper does not install a package or modify the
+consuming repository's `pyproject.toml`, lockfile, or environment. Put these commands in a shared GitLab CI template and
+include that template from every project that installs through Wheelguard; operators can run the same command manually
+before a large dependency update. The helper reuses `UV_INDEX_WHEELGUARD_PASSWORD`; `WHEELGUARD_TOKEN` remains available
+as an explicit override.
+
+The shared template is [`ci/preflight.gitlab-ci.yml`](ci/preflight.gitlab-ci.yml). Pin its include to a reviewed
+Wheelguard tag or commit:
+
+```yaml
+include:
+  - project: your-group/wheelguard
+    ref: <reviewed-tag-or-commit>
+    file: /ci/preflight.gitlab-ci.yml
+```
+
+It creates a `.pre` job whenever `uv.lock` exists, so normal build and test stages start only after the complete locked
+set is ready. This include is not inherited automatically: each consuming repository must add it, unless a GitLab group
+pipeline execution policy injects it centrally.
+
+The authenticated `POST /preflight` request is bounded to 500 entries and 2,000 version selections, normalizes and
+deduplicates project names, and evaluates at most eight projects concurrently to bound upstream, OSV, and database
+load. A 200 `READY` response means every selected version exists, passes publication policy, has a successful advisory
+evaluation with at least 15 minutes remaining in its configured lifetime, and has an authoritative artifact identity
+registered. Near-expiry evaluations refresh before the response so their authorization cannot expire during a normal
+subsequent install; a warm repeat safely reuses the fresh evaluation. A 409 `DENIED` response identifies vulnerable,
+missing, or otherwise policy-denied versions. A 503 `UNAVAILABLE` response includes `Retry-After: 30`; the CLI exits 3
+so CI may retry the whole preflight with bounded exponential backoff. Re-running is safe because advisory writes and
+artifact registration are idempotent. Do not proceed to `uv sync` after any nonzero preflight exit.
+
+Simple API requests likewise return 503 with `X-Wheelguard-Policy: advisory-unavailable` when OSV fails and no fresh
+evaluation exists. They do not advertise artifact links that the file endpoint would reject. For diagnosis, inspect
+the non-secret `metadata.timing`, `advisory.timing`, `artifact_registration.timing`, `preflight.project`, and
+`preflight.complete` application events and the response's per-project statuses. Timing events contain project names,
+cache states, counts, and elapsed milliseconds, but not credentials or source URLs. After correcting upstream or OSV
+availability, safely re-run the same command. The periodic refresh job orders targets by oldest successful evaluation,
+with never-scanned targets first, so repeated bounded runs drain the active set without starvation.
+
 The assumptions around OSV.dev availability, company use, privacy, and source licensing are recorded in
 [`docs/external-services.md`](docs/external-services.md).
 

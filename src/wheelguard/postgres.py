@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -10,6 +11,7 @@ from uuid import uuid4
 
 import psycopg
 from azure.identity.aio import DefaultAzureCredential
+from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -21,10 +23,23 @@ from wheelguard.repository_tokens import RepositoryTokenRecord, issue_repository
 class PostgresDatabase:
     """Persist repository state in Azure Database for PostgreSQL using Entra tokens."""
 
-    def __init__(self, url: str, credential: DefaultAzureCredential, token_scope: str) -> None:
+    def __init__(
+        self,
+        url: str,
+        credential: DefaultAzureCredential,
+        token_scope: str,
+        *,
+        maximum_connections: int = 8,
+    ) -> None:
         self._url = url
         self._credential = credential
         self._token_scope = token_scope
+        self._maximum_connections = maximum_connections
+        self._available: asyncio.LifoQueue[psycopg.AsyncConnection[dict[str, Any]]] = asyncio.LifoQueue(
+            maximum_connections
+        )
+        self._connection_count = 0
+        self._pool_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Verify that the separately migrated schema is available."""
@@ -110,12 +125,62 @@ class PostgresDatabase:
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[psycopg.AsyncConnection[dict[str, Any]]]:
-        token = await self._credential.get_token(self._token_scope)
-        connection = await psycopg.AsyncConnection.connect(self._url, password=token.token, row_factory=dict_row)
+        connection = await self._acquire_connection()
+        reusable = True
         try:
             yield connection
+        except BaseException:
+            reusable = not connection.broken
+            raise
         finally:
+            if reusable and not connection.closed:
+                try:
+                    if connection.info.transaction_status != TransactionStatus.IDLE:
+                        await connection.rollback()
+                except psycopg.Error:
+                    reusable = False
+            if reusable and not connection.closed and not connection.broken:
+                self._available.put_nowait(connection)
+            else:
+                await connection.close()
+                async with self._pool_lock:
+                    self._connection_count -= 1
+
+    async def _acquire_connection(self) -> psycopg.AsyncConnection[dict[str, Any]]:
+        """Reuse a bounded authenticated connection or open one pool slot."""
+        try:
+            return self._available.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        create = False
+        async with self._pool_lock:
+            try:
+                return self._available.get_nowait()
+            except asyncio.QueueEmpty:
+                if self._connection_count < self._maximum_connections:
+                    self._connection_count += 1
+                    create = True
+        if create:
+            try:
+                token = await self._credential.get_token(self._token_scope)
+                return await psycopg.AsyncConnection.connect(self._url, password=token.token, row_factory=dict_row)
+            except BaseException:
+                async with self._pool_lock:
+                    self._connection_count -= 1
+                raise
+        return await self._available.get()
+
+    async def aclose(self) -> None:
+        """Close idle pooled PostgreSQL connections during application shutdown."""
+        while True:
+            try:
+                connection = self._available.get_nowait()
+            except asyncio.QueueEmpty:
+                break
             await connection.close()
+            async with self._pool_lock:
+                self._connection_count -= 1
 
     async def get_project(self, normalized_name: str) -> CachedProject | None:
         async with self._connection() as connection:
@@ -146,21 +211,42 @@ class PostgresDatabase:
         if not records:
             return
         async with self._connection() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.executemany(
-                    """
-                    INSERT INTO artifacts (sha256, filename, source_url, size, project, version, verification_sha256)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT(sha256, filename) DO UPDATE SET
-                        source_url = excluded.source_url, size = excluded.size,
-                        project = excluded.project, version = excluded.version,
-                        verification_sha256 = excluded.verification_sha256
-                    """,
-                    [
-                        (r.sha256, r.filename, r.source_url, r.size, r.project, r.version, r.verification_sha256)
-                        for r in records
-                    ],
+            await connection.execute(
+                """
+                INSERT INTO artifacts (sha256, filename, source_url, size, project, version, verification_sha256)
+                SELECT incoming.sha256, incoming.filename, incoming.source_url, incoming.size,
+                       incoming.project, incoming.version, incoming.verification_sha256
+                FROM jsonb_to_recordset(%s) AS incoming(
+                    sha256 text, filename text, source_url text, size bigint,
+                    project text, version text, verification_sha256 text
                 )
+                ON CONFLICT(sha256, filename) DO UPDATE SET
+                    source_url = excluded.source_url, size = excluded.size,
+                    project = excluded.project, version = excluded.version,
+                    verification_sha256 = excluded.verification_sha256
+                WHERE (artifacts.source_url, artifacts.size, artifacts.project,
+                       artifacts.version, artifacts.verification_sha256)
+                    IS DISTINCT FROM
+                      (excluded.source_url, excluded.size, excluded.project,
+                       excluded.version, excluded.verification_sha256)
+                """,
+                (
+                    Jsonb(
+                        [
+                            {
+                                "sha256": record.sha256,
+                                "filename": record.filename,
+                                "source_url": record.source_url,
+                                "size": record.size,
+                                "project": record.project,
+                                "version": record.version,
+                                "verification_sha256": record.verification_sha256,
+                            }
+                            for record in records
+                        ]
+                    ),
+                ),
+            )
             await connection.commit()
 
     async def get_artifact(self, sha256: str, filename: str) -> ArtifactRecord | None:
@@ -203,7 +289,9 @@ class PostgresDatabase:
     async def list_advisory_targets(self, *, requested_since: datetime, limit: int = 25) -> list[str]:
         async with self._connection() as connection:
             result = await connection.execute(
-                "SELECT project FROM advisory_targets WHERE requested_at >= %s ORDER BY requested_at DESC LIMIT %s",
+                "SELECT targets.project FROM advisory_targets AS targets WHERE targets.requested_at >= %s "
+                "ORDER BY (SELECT MAX(checked_at) FROM advisory_scans WHERE project = targets.project) "
+                "ASC NULLS FIRST, targets.requested_at ASC, targets.project ASC LIMIT %s",
                 (requested_since, limit),
             )
             return [row["project"] for row in await result.fetchall()]

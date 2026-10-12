@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import weakref
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import Any
 from urllib.parse import urljoin
 
@@ -30,6 +32,8 @@ from wheelguard.models import (
     ArtifactRecord,
     SimplePayload,
 )
+
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 class AzureArtifactService:
@@ -57,6 +61,7 @@ class AzureArtifactService:
         self._locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = weakref.WeakValueDictionary()
 
     async def rewrite_urls(self, project: str, payload: SimplePayload, *, url_for: ArtifactUrl) -> SimplePayload:
+        started = perf_counter()
         result = deepcopy(payload)
         registered: list[dict[str, Any]] = []
         visible: list[Any] = []
@@ -78,7 +83,20 @@ class AzureArtifactService:
                 file["url"] = url_for(digest, filename)
                 visible.append(file)
         result["files"] = visible
+        validation_ms = (perf_counter() - started) * 1_000
+        write_started = perf_counter()
         await self._database.register_artifacts(project, {"files": registered})
+        database_write_ms = (perf_counter() - write_started) * 1_000
+        LOGGER.info(
+            "artifact_registration.timing project=%s examined=%d registered=%d validation_ms=%.1f "
+            "database_write_ms=%.1f total_ms=%.1f",
+            project,
+            len(files),
+            len(registered),
+            validation_ms,
+            database_write_ms,
+            (perf_counter() - started) * 1_000,
+        )
         return result
 
     def configure_policy(

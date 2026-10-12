@@ -2,9 +2,11 @@
 
 import hashlib
 import json
+import logging
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import Any
 
 import httpx
@@ -13,6 +15,7 @@ from wheelguard.models import AdvisoryResult, SimplePayload
 from wheelguard.policy import filename_version
 
 Clock = Callable[[], datetime]
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 class AdvisoryResponseError(Exception):
@@ -50,6 +53,7 @@ class OsvAdvisoryPolicy:
 
     async def apply(self, project: str, payload: SimplePayload, *, ttl: timedelta | None = None) -> AdvisoryResult:
         """Mark vulnerable files as yanked while preserving exact-pin access."""
+        started = perf_counter()
         versions = _payload_versions(payload)
         if not versions:
             return AdvisoryResult(payload, "MISS")
@@ -57,21 +61,56 @@ class OsvAdvisoryPolicy:
         versions_key = _versions_key(versions)
         now = self._clock()
         cached = await self._database.get_advisories(project, versions_key)
-        if cached is not None and now - cached.checked_at <= (ttl or self._ttl):
+        cache_lookup_ms = (perf_counter() - started) * 1_000
+        effective_ttl = self._ttl if ttl is None else ttl
+        if cached is not None and now - cached.checked_at < effective_ttl:
+            LOGGER.info(
+                "advisory.timing project=%s cache=hit versions=%d cache_lookup_ms=%.1f upstream_ms=0.0 "
+                "database_write_ms=0.0 total_ms=%.1f",
+                project,
+                len(versions),
+                cache_lookup_ms,
+                (perf_counter() - started) * 1_000,
+            )
             return _apply_advisories(payload, cached.advisories, "HIT")
 
+        upstream_started = perf_counter()
         try:
             advisories = await self._query_versions(project, versions)
         except (httpx.HTTPError, AdvisoryResponseError):
+            upstream_ms = (perf_counter() - upstream_started) * 1_000
+            LOGGER.warning(
+                "advisory.timing project=%s cache=%s versions=%d cache_lookup_ms=%.1f upstream_ms=%.1f "
+                "database_write_ms=0.0 total_ms=%.1f",
+                project,
+                "stale" if cached is not None else "error",
+                len(versions),
+                cache_lookup_ms,
+                upstream_ms,
+                (perf_counter() - started) * 1_000,
+            )
             if cached is not None:
                 return _apply_advisories(payload, cached.advisories, "STALE")
             return AdvisoryResult(payload, "ERROR")
 
+        upstream_ms = (perf_counter() - upstream_started) * 1_000
+        write_started = perf_counter()
         await self._database.put_advisories(
             project,
             versions_key,
             advisories,
             checked_at=now,
+        )
+        database_write_ms = (perf_counter() - write_started) * 1_000
+        LOGGER.info(
+            "advisory.timing project=%s cache=miss versions=%d cache_lookup_ms=%.1f upstream_ms=%.1f "
+            "database_write_ms=%.1f total_ms=%.1f",
+            project,
+            len(versions),
+            cache_lookup_ms,
+            upstream_ms,
+            database_write_ms,
+            (perf_counter() - started) * 1_000,
         )
         return _apply_advisories(payload, advisories, "MISS")
 

@@ -79,3 +79,45 @@ def test_gitlab_oidc_requires_allowed_project_and_protected_ref() -> None:
         await client.aclose()
 
     asyncio.run(exercise())
+
+
+def test_gitlab_oidc_wildcard_allows_any_project_but_still_requires_protected_ref() -> None:
+    """Allow an explicit all-project sentinel without weakening protected-ref checks."""
+    issuer = "https://gitlab.example.test"
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
+    jwk["kid"] = "test-key"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("openid-configuration"):
+            return httpx.Response(200, json={"jwks_uri": f"{issuer}/oauth/discovery/keys"})
+        return httpx.Response(200, json={"keys": [jwk]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    validator = GitLabOidcValidator(issuer, "wheelguard-publisher", ("*",), client=client)
+    now = datetime.now(UTC)
+
+    def token(protected: bool) -> str:
+        return jwt.encode(
+            {
+                "iss": issuer,
+                "aud": "wheelguard-publisher",
+                "sub": "project_path:any-group/new-package:ref_type:tag:ref:v1.0.0",
+                "iat": now,
+                "exp": now + timedelta(minutes=5),
+                "project_path": "any-group/new-package",
+                "ref_protected": protected,
+            },
+            private_key,
+            algorithm="RS256",
+            headers={"kid": "test-key"},
+        )
+
+    async def exercise() -> None:
+        identity = await validator.validate(token(True))
+        assert identity.project_path == "any-group/new-package"
+        with pytest.raises(IdentityError, match="protected"):
+            await validator.validate(token(False))
+        await client.aclose()
+
+    asyncio.run(exercise())
