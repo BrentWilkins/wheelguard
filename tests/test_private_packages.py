@@ -280,6 +280,41 @@ async def test_publish_resolve_and_download(setup: Any, kind: str) -> None:
 
 
 @pytest.mark.anyio
+async def test_publish_records_standard_project_links(setup: Any) -> None:
+    filename, content = distribution()
+    response = await setup.app.fetch(
+        upload_request(
+            filename,
+            content,
+            fields={"project_urls": "Changelog, https://gitlab.example/acx/private-demo/-/blob/main/CHANGELOG.md"},
+        )
+    )
+
+    assert response.status == 200
+    row = setup.db.connection.execute(
+        "SELECT repository_url, changelog_url FROM private_projects WHERE normalized_name = 'private-demo'"
+    ).fetchone()
+    assert tuple(row) == (None, "https://gitlab.example/acx/private-demo/-/blob/main/CHANGELOG.md")
+
+
+@pytest.mark.anyio
+async def test_identical_republish_can_backfill_project_links(setup: Any) -> None:
+    filename, content = distribution()
+    assert (await setup.app.fetch(upload_request(filename, content))).status == 200
+
+    repeated = upload_request(
+        filename,
+        content,
+        fields={"project_urls": "Repository, https://gitlab.example/acx/private-demo"},
+    )
+    assert (await setup.app.fetch(repeated)).status == 200
+    row = setup.db.connection.execute(
+        "SELECT repository_url FROM private_projects WHERE normalized_name = 'private-demo'"
+    ).fetchone()
+    assert row[0] == "https://gitlab.example/acx/private-demo"
+
+
+@pytest.mark.anyio
 async def test_collision_requires_audited_same_origin_approval(setup: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     async def exists(*args: Any, **kwargs: Any) -> Any:
         return SimpleNamespace(status=200)

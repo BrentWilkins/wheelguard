@@ -289,6 +289,8 @@ class PostgresDatabase:
         size: int,
         object_key: str,
         requires_python: str | None,
+        repository_url: str | None,
+        changelog_url: str | None,
         uploaded_at: datetime,
         actor: str,
     ) -> dict[str, Any] | None:
@@ -315,6 +317,19 @@ class PostgresDatabase:
                     uploaded_at,
                     project,
                 ),
+            )
+            await connection.execute(
+                """
+                    UPDATE private_projects
+                    SET repository_url = COALESCE(%s, repository_url),
+                        changelog_url = COALESCE(%s, changelog_url)
+                    WHERE normalized_name = %s
+                        AND EXISTS (
+                            SELECT 1 FROM private_artifacts
+                            WHERE project = %s AND filename = %s AND sha256 = %s
+                        )
+                    """,
+                (repository_url, changelog_url, project, project, filename, sha256),
             )
             await connection.execute(
                 """
@@ -349,6 +364,20 @@ class PostgresDatabase:
                 "SELECT filename, version, sha256, size, requires_python, uploaded_at, object_key "
                 "FROM private_artifacts WHERE project = %s ORDER BY filename",
                 (project,),
+            )
+            return list(await result.fetchall())
+
+    async def private_project_versions(self) -> list[dict[str, Any]]:
+        """List every published version for claimed private projects."""
+        async with self._connection() as connection:
+            result = await connection.execute(
+                """
+                SELECT p.normalized_name, a.version
+                FROM private_projects p
+                JOIN private_artifacts a ON a.project = p.normalized_name
+                WHERE p.claimed_at IS NOT NULL
+                ORDER BY p.normalized_name, a.version
+                """
             )
             return list(await result.fetchall())
 

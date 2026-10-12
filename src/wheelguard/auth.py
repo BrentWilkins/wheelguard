@@ -2,10 +2,40 @@
 
 import base64
 import binascii
+import hashlib
 import hmac
 from collections.abc import Iterable
+from datetime import datetime, timedelta
 
 MINIMUM_TOKEN_LENGTH = 32
+ADMIN_SESSION_TTL = timedelta(hours=8)
+
+
+class AdminSessionAuthenticator:
+    """Issue and verify short-lived sessions derived from the admin token."""
+
+    def __init__(self, token: str | None, *, ttl: timedelta = ADMIN_SESSION_TTL) -> None:
+        """Configure sessions that rotate automatically with the admin token."""
+        self._key = token.encode() if token is not None else None
+        self._ttl = ttl
+
+    def issue(self, now: datetime) -> str:
+        """Create a signed expiry value without placing the admin token in the cookie."""
+        if self._key is None:
+            raise ValueError("Administrator token sessions are disabled")
+        expiry = str(int((now + self._ttl).timestamp()))
+        signature = hmac.new(self._key, expiry.encode(), hashlib.sha256).hexdigest()
+        return f"{expiry}.{signature}"
+
+    def authorize(self, value: str | None, now: datetime) -> bool:
+        """Validate a session expiry and signature in constant time."""
+        if self._key is None or value is None:
+            return False
+        expiry, separator, signature = value.partition(".")
+        if not separator or not expiry.isascii() or not expiry.isdigit():
+            return False
+        expected = hmac.new(self._key, expiry.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected) and int(expiry) >= int(now.timestamp())
 
 
 class TokenAuthenticator:

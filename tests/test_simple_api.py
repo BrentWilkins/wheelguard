@@ -1,6 +1,7 @@
 from wheelguard.simple_api import (
     SIMPLE_HTML,
     SIMPLE_JSON,
+    html_response_media_type,
     negotiate_content_type,
     render_project_html,
 )
@@ -10,6 +11,11 @@ def test_content_negotiation() -> None:
     assert negotiate_content_type(f"{SIMPLE_HTML}, {SIMPLE_JSON}") == SIMPLE_JSON
     assert negotiate_content_type(f"{SIMPLE_JSON};q=0.1, {SIMPLE_HTML};q=0.9") == SIMPLE_HTML
     assert negotiate_content_type("image/png") is None
+
+
+def test_uses_browser_html_without_changing_explicit_simple_client_type() -> None:
+    assert html_response_media_type("text/html,application/xhtml+xml,*/*;q=0.8") == "text/html"
+    assert html_response_media_type(f"{SIMPLE_HTML},text/html;q=0.1") == SIMPLE_HTML
 
 
 def test_html_preserves_file_metadata() -> None:
