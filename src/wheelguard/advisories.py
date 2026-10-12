@@ -9,7 +9,6 @@ from typing import Any
 
 import httpx
 
-from wheelguard.database import Database
 from wheelguard.models import AdvisoryResult, SimplePayload
 from wheelguard.policy import filename_version
 
@@ -23,7 +22,7 @@ class AdvisoryResponseError(Exception):
 class NoopAdvisoryPolicy:
     """Leave project metadata unchanged when advisory checks are disabled."""
 
-    async def apply(self, project: str, payload: SimplePayload) -> AdvisoryResult:
+    async def apply(self, project: str, payload: SimplePayload, *, ttl: timedelta | None = None) -> AdvisoryResult:
         """Return project metadata without advisory evaluation."""
         return AdvisoryResult(payload, "DISABLED")
 
@@ -33,7 +32,7 @@ class OsvAdvisoryPolicy:
 
     def __init__(
         self,
-        database: Database,
+        database: Any,
         *,
         url: str,
         ttl: timedelta,
@@ -49,7 +48,7 @@ class OsvAdvisoryPolicy:
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
         self._clock = clock or (lambda: datetime.now(UTC))
 
-    async def apply(self, project: str, payload: SimplePayload) -> AdvisoryResult:
+    async def apply(self, project: str, payload: SimplePayload, *, ttl: timedelta | None = None) -> AdvisoryResult:
         """Mark vulnerable files as yanked while preserving exact-pin access."""
         versions = _payload_versions(payload)
         if not versions:
@@ -58,7 +57,7 @@ class OsvAdvisoryPolicy:
         versions_key = _versions_key(versions)
         now = self._clock()
         cached = await self._database.get_advisories(project, versions_key)
-        if cached is not None and now - cached.checked_at <= self._ttl:
+        if cached is not None and now - cached.checked_at <= (ttl or self._ttl):
             return _apply_advisories(payload, cached.advisories, "HIT")
 
         try:

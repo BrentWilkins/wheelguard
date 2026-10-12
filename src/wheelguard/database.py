@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from wheelguard.models import ArtifactRecord, ProjectResponse, SimplePayload
 from wheelguard.policy import filename_version
@@ -55,6 +56,12 @@ class Database:
         """Create the database directory and schema when absent."""
         self._initialize()
 
+    @_database_io
+    def health(self) -> None:
+        """Verify that the local catalog can answer a query."""
+        with sqlite3.connect(self._path) as connection:
+            connection.execute("SELECT 1").fetchone()
+
     def _initialize(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self._path) as connection:
@@ -74,6 +81,7 @@ class Database:
                     size INTEGER,
                     project TEXT,
                     version TEXT,
+                    verification_sha256 TEXT,
                     PRIMARY KEY (sha256, filename)
                 );
 
@@ -96,6 +104,8 @@ class Database:
                 connection.execute("ALTER TABLE artifacts ADD COLUMN project TEXT")
             if "version" not in columns:
                 connection.execute("ALTER TABLE artifacts ADD COLUMN version TEXT")
+            if "verification_sha256" not in columns:
+                connection.execute("ALTER TABLE artifacts ADD COLUMN verification_sha256 TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS artifacts_release_lookup ON artifacts (project, version)")
 
     @_database_io
@@ -166,15 +176,19 @@ class Database:
     def _write_artifacts(connection: sqlite3.Connection, records: list[ArtifactRecord]) -> None:
         connection.executemany(
             """
-                INSERT INTO artifacts (sha256, filename, source_url, size, project, version)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO artifacts (sha256, filename, source_url, size, project, version, verification_sha256)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sha256, filename) DO UPDATE SET
                     source_url = excluded.source_url,
                     size = excluded.size,
                     project = excluded.project,
-                    version = excluded.version
+                    version = excluded.version,
+                    verification_sha256 = excluded.verification_sha256
             """,
-            [(r.sha256, r.filename, r.source_url, r.size, r.project, r.version) for r in records],
+            [
+                (r.sha256, r.filename, r.source_url, r.size, r.project, r.version, r.verification_sha256)
+                for r in records
+            ],
         )
 
     @_database_io
@@ -186,14 +200,14 @@ class Database:
         with sqlite3.connect(self._path) as connection:
             row = connection.execute(
                 """
-                SELECT source_url, size, project, version FROM artifacts
+                SELECT source_url, size, project, version, verification_sha256 FROM artifacts
                 WHERE sha256 = ? AND filename = ?
                 """,
                 (sha256, filename),
             ).fetchone()
         if row is None:
             return None
-        return ArtifactRecord(sha256, filename, row[0], row[1], row[2], row[3])
+        return ArtifactRecord(sha256, filename, row[0], row[1], row[2], row[3], row[4])
 
     @_database_io
     def list_projects(self) -> list[str]:
@@ -333,11 +347,44 @@ def _artifact_records(project: str, payload: SimplePayload) -> Iterator[Artifact
         if not isinstance(digest, str) or not isinstance(filename, str) or not isinstance(source_url, str):
             continue
         version = filename_version(filename)
+        version_text = str(version) if version is not None else None
         yield ArtifactRecord(
             digest.casefold(),
             filename,
             source_url,
             size if isinstance(size, int) else None,
             project,
-            str(version) if version is not None else None,
+            version_text,
+            digest.casefold(),
         )
+        metadata_digest = _metadata_sha256(file)
+        if metadata_digest is not None:
+            yield ArtifactRecord(
+                digest.casefold(),
+                f"{filename}.metadata",
+                _append_metadata(source_url),
+                None,
+                project,
+                version_text,
+                metadata_digest,
+            )
+
+
+def _metadata_sha256(file: dict[str, object]) -> str | None:
+    for key in ("core-metadata", "dist-info-metadata", "data-core-metadata", "data-dist-info-metadata"):
+        value = file.get(key)
+        if not isinstance(value, dict):
+            continue
+        digest = value.get("sha256")
+        if (
+            isinstance(digest, str)
+            and len(digest) == 64
+            and all(character in "0123456789abcdefABCDEF" for character in digest)
+        ):
+            return digest.casefold()
+    return None
+
+
+def _append_metadata(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, f"{parts.path}.metadata", parts.query, ""))

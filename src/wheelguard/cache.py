@@ -27,11 +27,11 @@ class CachingRepository:
         self._database = database
         self._ttl = ttl
 
-    async def get_project(self, normalized_name: str) -> ProjectResponse:
+    async def get_project(self, normalized_name: str, *, ttl: timedelta | None = None) -> ProjectResponse:
         """Return fresh metadata or stale cached metadata during an outage."""
         now = datetime.now(UTC)
         cached = await self._database.get_project(normalized_name)
-        if cached is not None and now - cached.fetched_at <= self._ttl:
+        if cached is not None and now - cached.fetched_at <= (ttl or self._ttl):
             return cached.response
         try:
             fresh = await self._upstream.get_project(normalized_name)

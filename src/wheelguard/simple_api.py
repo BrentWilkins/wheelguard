@@ -79,7 +79,14 @@ def _file_link(file: dict[str, Any]) -> str:
     yanked = file.get("yanked")
     if yanked is not False and yanked is not None:
         _attribute(attributes, "data-yanked", "" if yanked is True else yanked)
-    metadata = file.get("core-metadata")
+    metadata = next(
+        (
+            file[key]
+            for key in ("core-metadata", "dist-info-metadata", "data-core-metadata", "data-dist-info-metadata")
+            if key in file
+        ),
+        None,
+    )
     _attribute(attributes, "data-core-metadata", _hash_value(metadata) or metadata)
     _attribute(attributes, "data-provenance", file.get("provenance"))
     advisories = file.get("wheelguard-advisories")
