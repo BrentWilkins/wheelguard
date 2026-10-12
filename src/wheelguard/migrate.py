@@ -36,14 +36,12 @@ async def _create_database_principal(
     )
     if oid_function is not None:
         schema, arity = oid_function
-        arguments = {
-            5: "%s, %s, 'service', false, false",
-            4: "%s, %s, 'service', false",
-            3: "%s, %s, 'service'",
+        template = {
+            5: sql.SQL("SELECT * FROM {}.{}(%s, %s, 'service', false, false)"),
+            4: sql.SQL("SELECT * FROM {}.{}(%s, %s, 'service', false)"),
+            3: sql.SQL("SELECT * FROM {}.{}(%s, %s, 'service')"),
         }[arity]
-        statement = sql.SQL("SELECT * FROM {}.{}(" + arguments + ")").format(
-            sql.Identifier(schema), sql.Identifier("pgaadauth_create_principal_with_oid")
-        )
+        statement = template.format(sql.Identifier(schema), sql.Identifier("pgaadauth_create_principal_with_oid"))
         await connection.execute(statement, (principal_name, object_id))
         return
 
