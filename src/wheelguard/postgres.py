@@ -203,7 +203,9 @@ class PostgresDatabase:
     async def list_advisory_targets(self, *, requested_since: datetime, limit: int = 25) -> list[str]:
         async with self._connection() as connection:
             result = await connection.execute(
-                "SELECT project FROM advisory_targets WHERE requested_at >= %s ORDER BY requested_at DESC LIMIT %s",
+                "SELECT targets.project FROM advisory_targets AS targets WHERE targets.requested_at >= %s "
+                "ORDER BY (SELECT MAX(checked_at) FROM advisory_scans WHERE project = targets.project) "
+                "ASC NULLS FIRST, targets.requested_at ASC, targets.project ASC LIMIT %s",
                 (requested_since, limit),
             )
             return [row["project"] for row in await result.fetchall()]

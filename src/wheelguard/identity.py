@@ -106,7 +106,9 @@ class GitLabOidcValidator:
             raise IdentityError("Invalid publisher identity token") from error
         project = claims.get("project_path")
         protected = claims.get("ref_protected")
-        if project not in self._allowed_projects:
+        if not isinstance(project, str) or (
+            "*" not in self._allowed_projects and project not in self._allowed_projects
+        ):
             raise IdentityError("Publisher project is not authorized")
         if protected not in {True, "true"}:
             raise IdentityError("Publishing requires a protected GitLab ref")

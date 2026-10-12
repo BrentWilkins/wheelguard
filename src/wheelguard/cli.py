@@ -11,6 +11,10 @@ from wheelguard.auth import configured_tokens
 
 def main() -> None:
     """Run Wheelguard's HTTP server."""
+    if len(sys.argv) > 1 and sys.argv[1] == "preflight":
+        from wheelguard.preflight_cli import main as preflight_main
+
+        raise SystemExit(preflight_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "token":
         from wheelguard.token_cli import main as token_main
 

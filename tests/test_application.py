@@ -230,6 +230,7 @@ async def test_authentication_protects_repository_but_not_health(tmp_path: Path)
         denied = await client.get("/simple/demo-package/")
         health = await client.get("/healthz")
         landing = await client.get("/")
+        preflight_client = await client.get("/tools/preflight.py")
 
     assert denied.status_code == 401
     assert denied.headers["WWW-Authenticate"] == 'Basic realm="Wheelguard"'
@@ -238,6 +239,10 @@ async def test_authentication_protects_repository_but_not_health(tmp_path: Path)
     assert "A policy-aware, outage-resistant path" in landing.text
     assert "http://test/simple/" in landing.text
     assert landing.headers["x-content-type-options"] == "nosniff"
+    assert preflight_client.status_code == 200
+    assert preflight_client.headers["x-content-type-options"] == "nosniff"
+    assert 'if __name__ == "__main__":' in preflight_client.text
+    assert "from wheelguard" not in preflight_client.text
 
 
 @pytest.mark.anyio

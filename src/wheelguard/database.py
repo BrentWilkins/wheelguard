@@ -235,9 +235,13 @@ class Database:
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute(
                 """
-                SELECT project FROM advisory_targets
-                WHERE requested_at >= ?
-                ORDER BY requested_at DESC
+                SELECT targets.project FROM advisory_targets AS targets
+                WHERE targets.requested_at >= ?
+                ORDER BY
+                    (SELECT MAX(checked_at) FROM advisory_scans WHERE project = targets.project) IS NOT NULL,
+                    (SELECT MAX(checked_at) FROM advisory_scans WHERE project = targets.project) ASC,
+                    targets.requested_at ASC,
+                    targets.project ASC
                 LIMIT ?
                 """,
                 (requested_since.timestamp(), limit),

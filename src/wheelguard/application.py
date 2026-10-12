@@ -2,7 +2,9 @@
 
 import asyncio
 import html
+import importlib.resources
 import logging
+import re
 import secrets
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
@@ -53,6 +55,9 @@ from wheelguard.vulnerabilities import automatic_fixed_version_allows
 Clock = Callable[[], datetime]
 LOGGER = logging.getLogger(__name__)
 ADMIN_SESSION_COOKIE = "wheelguard_admin_session"
+MAX_PREFLIGHT_PROJECTS = 500
+MAX_PREFLIGHT_VERSIONS = 2_000
+NORMALIZED_PROJECT = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 def create_app(
@@ -217,7 +222,7 @@ def create_app(
 
     @application.middleware("http")
     async def authenticate_repository(request: Request, call_next: RequestResponseEndpoint) -> Response:
-        protected = request.url.path.startswith(("/simple", "/files/"))
+        protected = request.url.path.startswith(("/simple", "/files/", "/preflight"))
         if protected:
             authorization = request.headers.get("Authorization")
             managed_authenticate = (
@@ -416,12 +421,221 @@ def create_app(
         }
         if upstream.last_serial is not None:
             headers["X-PyPI-Last-Serial"] = upstream.last_serial
+        if evaluated.status in {"STALE", "ERROR"}:
+            headers.update(
+                {
+                    "Cache-Control": "private, no-store",
+                    "Retry-After": "30",
+                    "X-Wheelguard-Policy": "advisory-unavailable",
+                }
+            )
+            detail = {
+                "detail": "A current advisory evaluation is unavailable; retry this project later",
+                "project": normalized,
+                "status": evaluated.status,
+            }
+            if content_type == SIMPLE_JSON:
+                return JSONResponse(detail, status_code=503, media_type=SIMPLE_JSON, headers=headers)
+            return HTMLResponse(
+                "<!doctype html><html><body><h1>Advisory evaluation unavailable</h1>"
+                f"<p>{html.escape(normalized)} is not ready; retry later.</p></body></html>",
+                status_code=503,
+                media_type=html_response_media_type(request.headers.get("Accept")),
+                headers=headers,
+            )
         if content_type == SIMPLE_JSON:
             return JSONResponse(published, media_type=SIMPLE_JSON, headers=headers)
         return HTMLResponse(
             render_project_html(published),
             media_type=html_response_media_type(request.headers.get("Accept")),
             headers=headers,
+        )
+
+    @application.post("/preflight")
+    async def preflight(request: Request) -> Response:
+        """Evaluate and register every project in one bounded locked-install preflight."""
+        try:
+            raw = await _json_body(request, maximum_bytes=262_144)
+            requested = _preflight_projects(raw)
+        except ValueError as error:
+            return JSONResponse({"detail": str(error)}, status_code=422)
+
+        runtime = await state.settings() if postgres_database else {}
+        metadata_ttl = timedelta(
+            seconds=int(runtime.get("metadata_ttl_seconds", configured.metadata_ttl.total_seconds()))
+        )
+        advisory_ttl = timedelta(
+            seconds=int(runtime.get("advisory_ttl_seconds", configured.advisory_ttl.total_seconds()))
+        )
+        minimum_age = timedelta(days=int(runtime.get("minimum_age_days", configured.minimum_age.days)))
+        fallback_minimum_age = timedelta(
+            hours=int(
+                runtime.get("fallback_minimum_age_hours", configured.fallback_minimum_age.total_seconds() // 3600)
+            )
+        )
+        request_policy = ReleasePolicy(
+            minimum_age,
+            allow_missing_upload_time=bool(
+                runtime.get("allow_missing_upload_time", configured.allow_missing_upload_time)
+            ),
+        )
+        osv_enabled = bool(runtime.get("osv_enabled", configured.osv_enabled)) or advisory_policy is not None
+        if not osv_enabled:
+            return JSONResponse(
+                {"detail": "Advisory enforcement is disabled; preflight cannot attest artifact readiness"},
+                status_code=409,
+                headers={"X-Wheelguard-Preflight": "DISABLED", "Cache-Control": "private, no-store"},
+            )
+        configure_artifacts = getattr(artifacts, "configure_policy", None)
+        if configure_artifacts is not None:
+            configure_artifacts(
+                enforce_advisories=True,
+                advisory_ttl=advisory_ttl,
+                maximum_bytes=int(runtime.get("maximum_artifact_bytes", configured.maximum_artifact_bytes)),
+            )
+
+        results: list[dict[str, Any]] = []
+        public_origin = configured.public_url or str(request.base_url).rstrip("/")
+        unavailable = False
+        denied = False
+        for project, versions in requested.items():
+            if private_packages is not None and await private_packages.owns(project):
+                private_payload = await private_packages.listing(project, public_origin)
+                missing = sorted(versions - _versions_in(private_payload))
+                status = "VERSION_NOT_FOUND" if missing else "READY"
+                denied |= bool(missing)
+                results.append(
+                    {
+                        "project": project,
+                        "status": status,
+                        "advisories": "PRIVATE",
+                        "versions": sorted(versions),
+                        **({"missing_versions": missing} if missing else {}),
+                    }
+                )
+                LOGGER.info(
+                    "preflight.project project=%s status=%s advisory_cache=private versions=%d",
+                    project,
+                    status.casefold(),
+                    len(versions),
+                )
+                continue
+            try:
+                upstream = await projects.get_project(project, ttl=metadata_ttl)
+            except UpstreamNotFoundError:
+                results.append({"project": project, "status": "NOT_FOUND"})
+                denied = True
+                LOGGER.info("preflight.project project=%s status=not_found", project)
+                continue
+            except UpstreamRepositoryError:
+                results.append({"project": project, "status": "UNAVAILABLE"})
+                unavailable = True
+                LOGGER.warning("preflight.project project=%s status=metadata_unavailable", project)
+                continue
+
+            requested_at = now()
+            await state.record_advisory_target(project, requested_at=requested_at)
+            if isinstance(advisories, OsvAdvisoryPolicy):
+                evaluated = await advisories.apply(project, upstream.payload, ttl=advisory_ttl)
+            else:
+                evaluated = await advisories.apply(project, upstream.payload)
+            if evaluated.status in {"STALE", "ERROR"}:
+                results.append({"project": project, "status": "UNAVAILABLE", "advisories": evaluated.status})
+                unavailable = True
+                LOGGER.warning(
+                    "preflight.project project=%s status=advisory_unavailable cache=%s",
+                    project,
+                    evaluated.status,
+                )
+                continue
+
+            available_versions = _versions_in(evaluated.payload)
+            missing = sorted(versions - available_versions)
+            advisory_map = _advisories_in(evaluated.payload)
+            vulnerable = sorted(version for version in versions if advisory_map.get(version))
+            automatic_allows = automatic_fixed_version_allows(
+                evaluated.payload,
+                advisory_map,
+                now=requested_at,
+                minimum_age=minimum_age,
+                fallback_minimum_age=fallback_minimum_age,
+            )
+            combined_overrides = dict(automatic_allows)
+            if postgres_database:
+                combined_overrides.update(await state.active_overrides(project, requested_at))
+            filtered = request_policy.apply(
+                evaluated.payload,
+                now=requested_at,
+                overrides=combined_overrides,
+                fallback_minimum_age=fallback_minimum_age,
+            )
+            policy_denied = sorted((versions & available_versions) - _versions_in(filtered.payload))
+            await artifacts.rewrite_urls(
+                project,
+                filtered.payload,
+                url_for=lambda digest, filename: f"{public_origin}/files/sha256/{digest}/{quote(filename, safe='')}",
+            )
+            status = "READY"
+            if missing:
+                status = "VERSION_NOT_FOUND"
+                denied = True
+            elif vulnerable:
+                status = "VULNERABLE"
+                denied = True
+            elif policy_denied:
+                status = "POLICY_DENIED"
+                denied = True
+            results.append(
+                {
+                    "project": project,
+                    "status": status,
+                    "advisories": evaluated.status,
+                    "versions": sorted(versions),
+                    **({"missing_versions": missing} if missing else {}),
+                    **({"vulnerable_versions": vulnerable} if vulnerable else {}),
+                    **({"policy_denied_versions": policy_denied} if policy_denied else {}),
+                }
+            )
+            LOGGER.info(
+                "preflight.project project=%s status=%s advisory_cache=%s versions=%d",
+                project,
+                status.casefold(),
+                evaluated.status,
+                len(versions),
+            )
+
+        overall = "UNAVAILABLE" if unavailable else "DENIED" if denied else "READY"
+        status_code = 503 if unavailable else 409 if denied else 200
+        LOGGER.info(
+            "preflight.complete status=%s projects=%d ready=%d unavailable=%d denied=%d",
+            overall.casefold(),
+            len(results),
+            sum(result["status"] == "READY" for result in results),
+            sum(result["status"] == "UNAVAILABLE" for result in results),
+            sum(result["status"] not in {"READY", "UNAVAILABLE"} for result in results),
+        )
+        return JSONResponse(
+            {"status": overall, "projects": results},
+            status_code=status_code,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Wheelguard-Preflight": overall,
+                **({"Retry-After": "30"} if unavailable else {}),
+            },
+        )
+
+    @application.get("/tools/preflight.py", include_in_schema=False)
+    async def preflight_client() -> Response:
+        """Serve the dependency-free uv lock preflight client for shared CI use."""
+        source = importlib.resources.files("wheelguard").joinpath("preflight_cli.py").read_text(encoding="utf-8")
+        return Response(
+            source,
+            media_type="text/x-python",
+            headers={
+                "Cache-Control": "private, no-cache",
+                "Content-Disposition": 'inline; filename="wheelguard-preflight.py"',
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @application.get("/files/sha256/{digest}/{filename}", name="artifact")
@@ -773,6 +987,50 @@ def _advisories_in(payload: SimplePayload) -> dict[str, list[str]]:
         if version is not None and isinstance(identifiers, list):
             advisories[str(version)] = [identifier for identifier in identifiers if isinstance(identifier, str)]
     return advisories
+
+
+def _versions_in(payload: SimplePayload) -> set[str]:
+    """Return authoritative versions represented by project metadata."""
+    files = payload.get("files", [])
+    if not isinstance(files, list):
+        return set()
+    return {
+        str(version)
+        for file in files
+        if isinstance(file, dict) and (version := filename_version(file.get("filename"))) is not None
+    }
+
+
+def _preflight_projects(raw: object) -> dict[str, set[str]]:
+    """Validate, normalize, and deduplicate a bounded preflight request."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("projects"), list):
+        raise ValueError("Preflight body must contain a projects array")
+    entries = raw["projects"]
+    if not entries:
+        raise ValueError("Preflight requires at least one project")
+    if len(entries) > MAX_PREFLIGHT_PROJECTS:
+        raise ValueError(f"Preflight accepts at most {MAX_PREFLIGHT_PROJECTS} project entries")
+    projects: dict[str, set[str]] = {}
+    version_count = 0
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            raise ValueError("Each preflight project must contain a string name")
+        raw_name = entry["name"]
+        normalized = canonicalize_name(raw_name)
+        if len(raw_name) > 200 or not NORMALIZED_PROJECT.fullmatch(normalized):
+            raise ValueError("Preflight project names must be valid Python distribution names")
+        versions = entry.get("versions")
+        if not isinstance(versions, list) or not versions:
+            raise ValueError("Each preflight project must contain at least one version")
+        selected = projects.setdefault(normalized, set())
+        for version in versions:
+            if not isinstance(version, str) or not version or len(version) > 128:
+                raise ValueError("Preflight versions must be non-empty strings of at most 128 characters")
+            selected.add(version)
+            version_count += 1
+            if version_count > MAX_PREFLIGHT_VERSIONS:
+                raise ValueError(f"Preflight accepts at most {MAX_PREFLIGHT_VERSIONS} version entries")
+    return projects
 
 
 async def _json_body(request: Request, maximum_bytes: int = 16_384) -> object:
