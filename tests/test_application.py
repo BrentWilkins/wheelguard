@@ -339,6 +339,31 @@ async def test_admin_login_uses_configured_public_origin_behind_proxy(tmp_path: 
 
 
 @pytest.mark.anyio
+async def test_admin_path_redirect_stays_relative_behind_proxy(tmp_path: Path) -> None:
+    application = create_app(
+        settings=Settings(
+            data_dir=tmp_path,
+            database_url="host=postgres.invalid dbname=wheelguard",
+            public_url="https://packages.example",
+            admin_token="a" * 32,
+            admin_token_actor="brent",
+        ),
+        repository=FakeRepository(),
+        database=AdminDatabase(tmp_path / "proxy-admin-path.db"),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://internal-container"
+    ) as client:
+        no_slash = await client.get("/admin")
+        with_slash = await client.get("/admin/")
+
+    assert no_slash.status_code == 308
+    assert no_slash.headers["location"] == "/admin/"
+    assert with_slash.status_code == 303
+    assert with_slash.headers["location"] == "/admin/login"
+
+
+@pytest.mark.anyio
 async def test_managed_repository_token_authentication(tmp_path: Path) -> None:
     token = "wg_" + "s" * 43
     database = ManagedTokenDatabase(tmp_path / "managed.db", token)

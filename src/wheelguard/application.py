@@ -607,6 +607,10 @@ def create_app(
         response.delete_cookie(ADMIN_SESSION_COOKIE, path="/admin")
         return response
 
+    @application.get("/admin")
+    async def admin_page_redirect() -> Response:
+        return RedirectResponse("/admin/", status_code=308)
+
     @application.get("/admin/")
     async def admin_page(request: Request) -> Response:
         try:
