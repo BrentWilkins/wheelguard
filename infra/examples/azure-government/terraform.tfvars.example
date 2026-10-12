@@ -1,0 +1,36 @@
+location                = "usgovarizona"
+network_subscription_id = "00000000-0000-0000-0000-000000000000"
+virtual_network_id      = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/network-rg/providers/Microsoft.Network/virtualNetworks/example-vnet"
+
+container_apps_subnet_prefix   = "10.1.6.0/23"
+postgres_subnet_prefix         = "10.1.8.0/28"
+private_endpoint_subnet_prefix = "10.1.8.16/28"
+
+private_dns_zone_resource_group_name      = "network-rg"
+blob_private_dns_zone_resource_group_name = "central-private-dns-rg"
+hostname                                   = "pypi.example.internal"
+# documentation_url                        = "https://docs.example.com/wheelguard/"
+
+# Enable after storing a PFX certificate in Key Vault and configuring the
+# versioned certificate secret URL and vault resource ID.
+enable_tls = false
+
+# Use a public immutable placeholder only for the first apply. After ACR is
+# created, build Wheelguard and replace this with its ACR digest reference.
+image            = "bootstrap-pending"
+deploy_workloads = false
+
+# Populate only when using Microsoft-hosted ACR Tasks. Keep this to the
+# documented/observed regional agent egress ranges; do not use a catch-all.
+acr_task_agent_ip_ranges = []
+
+entra_tenant_id           = "00000000-0000-0000-0000-000000000000"
+publisher_oidc_issuer     = "https://gitlab.example.com"
+publisher_oidc_projects   = ["group/wheelguard"]
+deployment_principal_id   = "00000000-0000-0000-0000-000000000000"
+
+tags = {
+  application = "wheelguard"
+  environment = "dev"
+  managed-by  = "terraform"
+}

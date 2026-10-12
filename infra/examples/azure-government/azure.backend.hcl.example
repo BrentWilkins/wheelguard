@@ -1,0 +1,7 @@
+resource_group_name  = "terraform-state-rg"
+storage_account_name = "examplestateaccount"
+container_name       = "tfstate"
+key                  = "wheelguard/dev/terraform.tfstate"
+use_azuread_auth     = true
+environment          = "usgovernment"
+subscription_id      = "00000000-0000-0000-0000-000000000000"
