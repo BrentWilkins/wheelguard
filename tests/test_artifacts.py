@@ -19,12 +19,15 @@ def anyio_backend() -> str:
 async def test_downloads_verifies_and_reuses_artifact(tmp_path: Path) -> None:
     content = b"trusted wheel bytes"
     digest = hashlib.sha256(content).hexdigest()
+    metadata = b"Metadata-Version: 2.4\nName: demo\nVersion: 1.0\n"
+    metadata_digest = hashlib.sha256(metadata).hexdigest()
     requests = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal requests
         requests += 1
-        return httpx.Response(200, content=content, request=request)
+        body = metadata if request.url.path.endswith(".metadata") else content
+        return httpx.Response(200, content=body, request=request)
 
     database = Database(tmp_path / "wheelguard.db")
     await database.initialize()
@@ -43,6 +46,7 @@ async def test_downloads_verifies_and_reuses_artifact(tmp_path: Path) -> None:
                     "filename": "demo-1.0-py3-none-any.whl",
                     "url": "https://files.example/demo.whl",
                     "hashes": {"sha256": digest},
+                    "data-dist-info-metadata": {"sha256": metadata_digest},
                     "size": len(content),
                 }
             ],
@@ -55,11 +59,14 @@ async def test_downloads_verifies_and_reuses_artifact(tmp_path: Path) -> None:
         first = await service.get_path(digest, "demo-1.0-py3-none-any.whl")
         assert len(service._locks) == 0
         second = await service.get_path(digest, "demo-1.0-py3-none-any.whl")
+        sidecar = await service.get_path(digest, "demo-1.0-py3-none-any.whl.metadata")
 
     assert rewritten["files"][0]["url"].startswith("/files/")
+    assert rewritten["files"][0]["data-dist-info-metadata"] == {"sha256": metadata_digest}
     assert first.read_bytes() == content
     assert second == first
-    assert requests == 1
+    assert sidecar.read_bytes() == metadata
+    assert requests == 2
 
 
 @pytest.mark.anyio

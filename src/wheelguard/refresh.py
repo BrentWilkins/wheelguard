@@ -4,8 +4,8 @@ import asyncio
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from wheelguard.database import Database
 from wheelguard.models import AdvisoryPolicy
 
 Clock = Callable[[], datetime]
@@ -17,7 +17,7 @@ class AdvisoryRefresher:
 
     def __init__(
         self,
-        database: Database,
+        database: Any,
         advisory_policy: AdvisoryPolicy,
         *,
         active_window: timedelta,

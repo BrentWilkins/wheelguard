@@ -27,6 +27,7 @@ class Settings:
     """Describe immutable Wheelguard runtime settings."""
 
     upstream_url: str = "https://pypi.org/simple/"
+    public_url: str | None = None
     minimum_age: timedelta = timedelta(days=14)
     fallback_minimum_age: timedelta = timedelta(hours=24)
     upstream_timeout_seconds: float = 30.0
@@ -43,18 +44,48 @@ class Settings:
     advisory_refresh_batch_size: int = 25
     auth_token: str | None = None
     auth_tokens: tuple[str, ...] = ()
+    admin_token: str | None = None
+    admin_token_actor: str = "temporary-admin"
+    managed_token_auth_enabled: bool = False
+    database_url: str | None = None
+    database_token_scope: str = "https://ossrdbms-aad.database.windows.net/.default"
+    database_app_principal: str | None = None
+    database_app_object_id: str | None = None
+    azure_storage_account_url: str | None = None
+    azure_artifact_container: str = "artifacts"
+    publisher_oidc_issuer: str | None = None
+    publisher_oidc_audience: str = "wheelguard-publisher"
+    publisher_oidc_projects: tuple[str, ...] = ()
+    entra_admin_enabled: bool = False
+    trust_private_ingress: bool = False
 
     def __post_init__(self) -> None:
         """Reject unsafe remote endpoints and empty artifact allowlists."""
         upstream = urlsplit(self.upstream_url)
         if upstream.scheme != "https" or not upstream.hostname:
             raise ValueError("WHEELGUARD_UPSTREAM_URL must be an HTTPS URL")
+        if self.public_url is not None:
+            public = urlsplit(self.public_url)
+            if (
+                public.scheme not in {"http", "https"}
+                or not public.hostname
+                or public.username is not None
+                or public.password is not None
+                or public.path not in {"", "/"}
+                or public.query
+                or public.fragment
+            ):
+                raise ValueError("WHEELGUARD_PUBLIC_URL must be an HTTP(S) origin without credentials or a path")
         if not self.allowed_artifact_hosts:
             raise ValueError("WHEELGUARD_ALLOWED_ARTIFACT_HOSTS cannot be empty")
         if self.osv_enabled:
             osv = urlsplit(self.osv_url)
             if osv.scheme != "https" or not osv.hostname:
                 raise ValueError("WHEELGUARD_OSV_URL must be an HTTPS URL")
+        if (self.database_app_principal is None) != (self.database_app_object_id is None):
+            raise ValueError(
+                "WHEELGUARD_DATABASE_APP_PRINCIPAL and WHEELGUARD_DATABASE_APP_OBJECT_ID must be configured together"
+            )
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -66,6 +97,7 @@ class Settings:
         )
         return cls(
             upstream_url=os.getenv("WHEELGUARD_UPSTREAM_URL", "https://pypi.org/simple/"),
+            public_url=os.getenv("WHEELGUARD_PUBLIC_URL") or None,
             minimum_age=timedelta(days=_integer("WHEELGUARD_MINIMUM_AGE_DAYS", "14")),
             fallback_minimum_age=timedelta(hours=_integer("WHEELGUARD_FALLBACK_MINIMUM_AGE_HOURS", "24")),
             upstream_timeout_seconds=float(os.getenv("WHEELGUARD_UPSTREAM_TIMEOUT", "30")),
@@ -84,4 +116,24 @@ class Settings:
             auth_tokens=tuple(
                 token.strip() for token in os.getenv("WHEELGUARD_AUTH_TOKENS", "").split(",") if token.strip()
             ),
+            admin_token=os.getenv("WHEELGUARD_ADMIN_TOKEN") or None,
+            admin_token_actor=os.getenv("WHEELGUARD_ADMIN_TOKEN_ACTOR", "temporary-admin").strip() or "temporary-admin",
+            managed_token_auth_enabled=_boolean("WHEELGUARD_MANAGED_TOKEN_AUTH_ENABLED", "false"),
+            database_url=os.getenv("WHEELGUARD_DATABASE_URL") or None,
+            database_token_scope=os.getenv(
+                "WHEELGUARD_DATABASE_TOKEN_SCOPE", "https://ossrdbms-aad.database.windows.net/.default"
+            ),
+            database_app_principal=os.getenv("WHEELGUARD_DATABASE_APP_PRINCIPAL") or None,
+            database_app_object_id=os.getenv("WHEELGUARD_DATABASE_APP_OBJECT_ID") or None,
+            azure_storage_account_url=os.getenv("WHEELGUARD_AZURE_STORAGE_ACCOUNT_URL") or None,
+            azure_artifact_container=os.getenv("WHEELGUARD_AZURE_ARTIFACT_CONTAINER", "artifacts"),
+            publisher_oidc_issuer=os.getenv("WHEELGUARD_PUBLISHER_OIDC_ISSUER") or None,
+            publisher_oidc_audience=os.getenv("WHEELGUARD_PUBLISHER_OIDC_AUDIENCE", "wheelguard-publisher"),
+            publisher_oidc_projects=tuple(
+                project.strip()
+                for project in os.getenv("WHEELGUARD_PUBLISHER_OIDC_PROJECTS", "").split(",")
+                if project.strip()
+            ),
+            entra_admin_enabled=_boolean("WHEELGUARD_ENTRA_ADMIN_ENABLED", "false"),
+            trust_private_ingress=_boolean("WHEELGUARD_TRUST_PRIVATE_INGRESS", "false"),
         )

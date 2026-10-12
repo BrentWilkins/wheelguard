@@ -28,6 +28,23 @@ def test_loads_additional_authentication_tokens(monkeypatch: pytest.MonkeyPatch)
     assert Settings.from_environment().auth_tokens == ("a" * 32, "b" * 32)
 
 
+def test_database_application_principal_requires_object_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WHEELGUARD_DATABASE_APP_PRINCIPAL", "wheelguard-app")
+
+    with pytest.raises(ValueError, match="must be configured together"):
+        Settings.from_environment()
+
+
+def test_loads_database_application_principal_object_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WHEELGUARD_DATABASE_APP_PRINCIPAL", "wheelguard-app")
+    monkeypatch.setenv("WHEELGUARD_DATABASE_APP_OBJECT_ID", "00000000-0000-0000-0000-000000000001")
+
+    settings = Settings.from_environment()
+
+    assert settings.database_app_principal == "wheelguard-app"
+    assert settings.database_app_object_id == "00000000-0000-0000-0000-000000000001"
+
+
 def test_rejects_insecure_upstream_and_empty_artifact_allowlist() -> None:
     """Keep self-hosted network destinations explicit and encrypted."""
     with pytest.raises(ValueError, match="HTTPS URL"):

@@ -37,3 +37,17 @@ def test_allows_non_loopback_bind_with_token_list(monkeypatch: pytest.MonkeyPatc
     cli.main()
 
     assert called["host"] == "0.0.0.0"
+
+
+def test_allows_non_loopback_bind_behind_explicit_private_ingress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit credential-free package reads only when the operator opts into a private network boundary."""
+    called: dict[str, Any] = {}
+    monkeypatch.setenv("WHEELGUARD_HOST", "0.0.0.0")
+    monkeypatch.setenv("WHEELGUARD_TRUST_PRIVATE_INGRESS", "true")
+    monkeypatch.delenv("WHEELGUARD_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("WHEELGUARD_AUTH_TOKENS", raising=False)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: called.update(kwargs))
+
+    cli.main()
+
+    assert called["host"] == "0.0.0.0"

@@ -108,6 +108,15 @@ class ArtifactService:
         await self._database.register_artifacts(project, {"files": registered})
         return result
 
+    def configure_policy(
+        self, *, enforce_advisories: bool, advisory_ttl: timedelta, maximum_bytes: int | None = None
+    ) -> None:
+        """Apply administrator-editable policy values for the next request."""
+        self._enforce_advisories = enforce_advisories
+        self._advisory_ttl = advisory_ttl
+        if maximum_bytes is not None:
+            self._maximum_bytes = maximum_bytes
+
     async def get_path(self, digest: str, filename: str) -> Path:
         """Return a verified cached artifact, downloading it when necessary."""
         digest = digest.casefold()
@@ -169,7 +178,7 @@ class ArtifactService:
                         output.write(chunk)
                 output.flush()
                 os.fsync(output.fileno())
-            if digest.hexdigest() != record.sha256:
+            if digest.hexdigest() != (record.verification_sha256 or record.sha256):
                 raise ArtifactDownloadError("Artifact SHA-256 does not match upstream metadata")
             return self._store.commit(temporary, record)
         except (httpx.HTTPError, OSError) as error:

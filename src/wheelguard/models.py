@@ -41,6 +41,7 @@ class ArtifactRecord:
     size: int | None = None
     project: str | None = None
     version: str | None = None
+    verification_sha256: str | None = None
 
 
 class ArtifactNotFoundError(Exception):

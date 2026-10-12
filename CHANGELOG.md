@@ -6,6 +6,12 @@ All notable changes to Wheelguard are documented here.
 
 ### Added
 
+- Add optional PostgreSQL metadata and Azure Blob artifact backends with
+  managed-identity authentication and schema migration commands.
+- Support short-lived GitLab OIDC publishing and individually managed,
+  revocable repository tokens in the production runtime.
+- Proxy and verify PEP 658 metadata sidecars across the supported storage
+  backends.
 - Accept private wheel and source-distribution uploads through the PyPI legacy multipart protocol at `/upload/`, compatible with `uv publish` and Twine.
 - Require a separate `WHEELGUARD_UPLOAD_TOKEN`; repository credentials remain read-only.
 - Serve privately owned names exclusively from private artifacts, immediately and without the public release cooldown or PyPI OSV lookup.

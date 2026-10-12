@@ -53,7 +53,7 @@ SETTING_DEFINITIONS = {
         1,
         104_857_600,
         "Per-artifact download limit (bytes)",
-        "Reject larger distributions before they enter R2 (maximum 100 MiB for bounded Worker memory use).",
+        "Reject larger distributions before they enter artifact storage (maximum 100 MiB).",
     ),
     "osv_enabled": SettingDefinition(
         "boolean",

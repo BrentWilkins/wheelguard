@@ -16,8 +16,19 @@ dependencies = [
     "uvicorn>=0.52.4",
 ]
 
+[project.optional-dependencies]
+azure = [
+    "aiohttp>=3.9.0",
+    "azure-identity>=1.25.1",
+    "azure-storage-blob>=12.28.0",
+    "psycopg[binary]>=3.3.2",
+    "pyjwt[crypto]>=2.10.1",
+]
+
 [project.scripts]
 wheelguard = "wheelguard.cli:main"
+wheelguard-migrate = "wheelguard.migrate:main"
+wheelguard-refresh-advisories = "wheelguard.refresh_job:main"
 
 [build-system]
 requires = ["uv_build>=0.12.1,<0.13.0"]
@@ -25,10 +36,15 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "aiohttp>=3.9.0",
+    "azure-identity>=1.25.1",
+    "azure-storage-blob>=12.28.0",
     "bandit>=1.9.4",
     "mypy>=2.3.1",
     "pip-audit>=2.10.1",
     "pytest>=9.1.1",
+    "psycopg[binary]>=3.3.2",
+    "pyjwt[crypto]>=2.10.1",
     "ruff>=0.16.5",
     "workers-py>=1.17.1",
     "workers-runtime-sdk>=1.8.2",
@@ -50,6 +66,12 @@ convention = "pep257"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D"]
+"src/wheelguard/admin_service.py" = ["D102", "D107"]
+"src/wheelguard/application.py" = ["E501"] # Embedded administrator HTML/JavaScript.
+"src/wheelguard/azure_artifacts.py" = ["D102", "D107"]
+"src/wheelguard/azure_storage.py" = ["D102", "D105", "D107"]
+"src/wheelguard/postgres.py" = ["D102", "D107"]
+"src/wheelguard/private_service.py" = ["D102", "D107"]
 
 [tool.mypy]
 strict = true

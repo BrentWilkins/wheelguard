@@ -134,6 +134,27 @@ docker run --rm -p 127.0.0.1:8000:8000 \
   -v wheelguard-data:/data wheelguard
 ```
 
+### PostgreSQL and Azure Blob runtime
+
+Install the optional production dependencies with `wheelguard[azure]` to store
+metadata in PostgreSQL and artifacts in Azure Blob Storage. The runtime uses
+Azure's default credential chain, including managed identity when deployed in
+Azure:
+
+```shell
+WHEELGUARD_DATABASE_URL='host=database.example dbname=wheelguard sslmode=require' \
+WHEELGUARD_AZURE_STORAGE_ACCOUNT_URL='https://storage.example.com' \
+WHEELGUARD_PUBLIC_URL='https://packages.example.com' \
+uv run wheelguard
+```
+
+Run `wheelguard-migrate` before starting a new deployment and schedule
+`wheelguard-refresh-advisories` to refresh active projects. Optional managed
+repository tokens are created and revoked with `wheelguard token`; only their
+digests are stored. Private publishing can use short-lived GitLab OIDC tokens
+when `WHEELGUARD_PUBLISHER_OIDC_ISSUER` and an explicit
+`WHEELGUARD_PUBLISHER_OIDC_PROJECTS` allowlist are configured.
+
 ### Cloudflare development
 
 The Cloudflare entrypoint provides `/healthz`, authenticated repository routes under `/simple/` and `/files/`, and the

@@ -2,6 +2,7 @@
 .dev.vars.*
 .env
 .env.*
+.wheelguard-admin-token
 !.dev.vars.example
 !.env.example
 .mypy_cache/
@@ -9,6 +10,12 @@
 .ruff_cache/
 .venv/
 .wrangler/
+.terraform/
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+*.backend.hcl
+!*.backend.hcl.example
 .serena/
 src/js-stubs/
 python_modules/
