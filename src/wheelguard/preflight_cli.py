@@ -102,6 +102,9 @@ def _print_result(result: object) -> None:
     if not isinstance(result, dict):
         print("Wheelguard returned an invalid preflight response", file=sys.stderr)
         return
+    detail = result.get("detail")
+    if isinstance(detail, str):
+        print(f"Wheelguard preflight failed: {detail}", file=sys.stderr)
     status = result.get("status", "ERROR")
     projects = result.get("projects", [])
     counts: dict[str, int] = {}
@@ -111,9 +114,70 @@ def _print_result(result: object) -> None:
                 project_status = str(project.get("status", "ERROR"))
                 counts[project_status] = counts.get(project_status, 0) + 1
                 if project_status != "READY":
-                    print(f"{project.get('project', '<unknown>')}: {project_status}", file=sys.stderr)
+                    _print_project_failure(project, project_status)
     summary = " ".join(f"{key.lower()}={value}" for key, value in sorted(counts.items()))
     print(f"preflight={status} projects={len(projects) if isinstance(projects, list) else 0} {summary}".rstrip())
+
+
+def _print_project_failure(project: dict[str, Any], status: str) -> None:
+    """Explain a failed project policy decision and its safe next action."""
+    name = str(project.get("project", "<unknown>"))
+    versions = _failure_versions(project, status)
+    subject = ", ".join(f"{name}=={version}" for version in versions) if versions else name
+    reason, remediation = _failure_guidance(project, status)
+    print(f"{subject}: {status}", file=sys.stderr)
+    print(f"  reason: {reason}", file=sys.stderr)
+    print(f"  remediation: {remediation}", file=sys.stderr)
+
+
+def _failure_versions(project: dict[str, Any], status: str) -> list[str]:
+    fields = {
+        "VERSION_NOT_FOUND": "missing_versions",
+        "VULNERABLE": "vulnerable_versions",
+        "POLICY_DENIED": "policy_denied_versions",
+    }
+    candidate = project.get(fields.get(status, "versions"), [])
+    return [str(version) for version in candidate] if isinstance(candidate, list) else []
+
+
+def _failure_guidance(project: dict[str, Any], status: str) -> tuple[str, str]:
+    if status == "UNAVAILABLE" and project.get("advisories") in {"STALE", "ERROR"}:
+        return (
+            "a current vulnerability advisory evaluation could not be obtained",
+            "retry the preflight; if it persists, ask a WheelGuard operator to restore advisory refresh. "
+            "Do not bypass the private index",
+        )
+    if status == "UNAVAILABLE":
+        return (
+            "project metadata could not be refreshed",
+            "retry the preflight; if it persists, ask a WheelGuard operator to restore metadata refresh. "
+            "Do not bypass the private index",
+        )
+    if status == "NOT_FOUND":
+        return (
+            "the project is not present in the configured upstream repository",
+            "verify the package name and configured private index",
+        )
+    if status == "VERSION_NOT_FOUND":
+        return (
+            "the locked version is not present in the configured upstream repository",
+            "select an available version from the private index and regenerate the lockfile",
+        )
+    if status == "VULNERABLE":
+        return (
+            "the locked version has a known vulnerability",
+            "select an eligible fixed version from the private index and regenerate the lockfile",
+        )
+    if status == "POLICY_DENIED":
+        return (
+            "the locked version is ineligible under WheelGuard release policy",
+            "select an eligible version from the private index; request a time-bounded administrator override "
+            "only after an explicit risk decision",
+        )
+    return (
+        "WheelGuard could not attest this locked dependency",
+        "inspect the preflight response or contact a WheelGuard operator; do not bypass the private index",
+    )
 
 
 if __name__ == "__main__":

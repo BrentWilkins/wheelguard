@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from inspect import isawaitable
 from pathlib import Path
+from time import perf_counter
 from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
@@ -53,10 +54,12 @@ from wheelguard.upstream import PyPIRepository
 from wheelguard.vulnerabilities import automatic_fixed_version_allows
 
 Clock = Callable[[], datetime]
-LOGGER = logging.getLogger(__name__)
+LOGGER = logging.getLogger("uvicorn.error")
 ADMIN_SESSION_COOKIE = "wheelguard_admin_session"
 MAX_PREFLIGHT_PROJECTS = 500
 MAX_PREFLIGHT_VERSIONS = 2_000
+PREFLIGHT_CONCURRENCY = 8
+PREFLIGHT_MINIMUM_ADVISORY_VALIDITY = timedelta(minutes=15)
 NORMALIZED_PROJECT = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -199,7 +202,7 @@ def create_app(
                 refresh_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await refresh_task
-            for resource in (projects, artifacts, advisories, private_packages):
+            for resource in (projects, artifacts, advisories, private_packages, state):
                 if resource is None:
                     continue
                 close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
@@ -454,6 +457,7 @@ def create_app(
     @application.post("/preflight")
     async def preflight(request: Request) -> Response:
         """Evaluate and register every project in one bounded locked-install preflight."""
+        preflight_started = perf_counter()
         try:
             raw = await _json_body(request, maximum_bytes=262_144)
             requested = _preflight_projects(raw)
@@ -494,60 +498,89 @@ def create_app(
                 maximum_bytes=int(runtime.get("maximum_artifact_bytes", configured.maximum_artifact_bytes)),
             )
 
-        results: list[dict[str, Any]] = []
         public_origin = configured.public_url or str(request.base_url).rstrip("/")
-        unavailable = False
-        denied = False
-        for project, versions in requested.items():
+        minimum_cache_ttl = max(advisory_ttl - PREFLIGHT_MINIMUM_ADVISORY_VALIDITY, timedelta(0))
+
+        async def evaluate_project(project: str, versions: set[str]) -> dict[str, Any]:
+            project_started = perf_counter()
+            timings: dict[str, float] = {}
+
+            phase_started = perf_counter()
             if private_packages is not None and await private_packages.owns(project):
+                timings["private_lookup_ms"] = (perf_counter() - phase_started) * 1_000
+                phase_started = perf_counter()
                 private_payload = await private_packages.listing(project, public_origin)
+                timings["private_listing_ms"] = (perf_counter() - phase_started) * 1_000
                 missing = sorted(versions - _versions_in(private_payload))
                 status = "VERSION_NOT_FOUND" if missing else "READY"
-                denied |= bool(missing)
-                results.append(
-                    {
-                        "project": project,
-                        "status": status,
-                        "advisories": "PRIVATE",
-                        "versions": sorted(versions),
-                        **({"missing_versions": missing} if missing else {}),
-                    }
-                )
+                result = {
+                    "project": project,
+                    "status": status,
+                    "advisories": "PRIVATE",
+                    "versions": sorted(versions),
+                    **({"missing_versions": missing} if missing else {}),
+                }
                 LOGGER.info(
-                    "preflight.project project=%s status=%s advisory_cache=private versions=%d",
+                    "preflight.project project=%s status=%s metadata_cache=private advisory_cache=private versions=%d "
+                    "private_lookup_ms=%.1f private_listing_ms=%.1f total_ms=%.1f",
                     project,
                     status.casefold(),
                     len(versions),
+                    timings["private_lookup_ms"],
+                    timings["private_listing_ms"],
+                    (perf_counter() - project_started) * 1_000,
                 )
-                continue
+                return result
+            timings["private_lookup_ms"] = (perf_counter() - phase_started) * 1_000
+
+            phase_started = perf_counter()
             try:
                 upstream = await projects.get_project(project, ttl=metadata_ttl)
             except UpstreamNotFoundError:
-                results.append({"project": project, "status": "NOT_FOUND"})
-                denied = True
-                LOGGER.info("preflight.project project=%s status=not_found", project)
-                continue
+                timings["metadata_ms"] = (perf_counter() - phase_started) * 1_000
+                LOGGER.info(
+                    "preflight.project project=%s status=not_found metadata_ms=%.1f total_ms=%.1f",
+                    project,
+                    timings["metadata_ms"],
+                    (perf_counter() - project_started) * 1_000,
+                )
+                return {"project": project, "status": "NOT_FOUND"}
             except UpstreamRepositoryError:
-                results.append({"project": project, "status": "UNAVAILABLE"})
-                unavailable = True
-                LOGGER.warning("preflight.project project=%s status=metadata_unavailable", project)
-                continue
+                timings["metadata_ms"] = (perf_counter() - phase_started) * 1_000
+                LOGGER.warning(
+                    "preflight.project project=%s status=metadata_unavailable metadata_ms=%.1f total_ms=%.1f",
+                    project,
+                    timings["metadata_ms"],
+                    (perf_counter() - project_started) * 1_000,
+                )
+                return {"project": project, "status": "UNAVAILABLE"}
+            timings["metadata_ms"] = (perf_counter() - phase_started) * 1_000
 
             requested_at = now()
+            phase_started = perf_counter()
             await state.record_advisory_target(project, requested_at=requested_at)
+            timings["target_write_ms"] = (perf_counter() - phase_started) * 1_000
+            phase_started = perf_counter()
             if isinstance(advisories, OsvAdvisoryPolicy):
-                evaluated = await advisories.apply(project, upstream.payload, ttl=advisory_ttl)
+                # Reuse only scans that retain a bounded install window. Near-expiry
+                # scans refresh so artifact authorization cannot expire mid-sync.
+                evaluated = await advisories.apply(project, upstream.payload, ttl=minimum_cache_ttl)
             else:
                 evaluated = await advisories.apply(project, upstream.payload)
+            timings["advisory_ms"] = (perf_counter() - phase_started) * 1_000
             if evaluated.status in {"STALE", "ERROR"}:
-                results.append({"project": project, "status": "UNAVAILABLE", "advisories": evaluated.status})
-                unavailable = True
                 LOGGER.warning(
-                    "preflight.project project=%s status=advisory_unavailable cache=%s",
+                    "preflight.project project=%s status=advisory_unavailable metadata_cache=%s advisory_cache=%s "
+                    "metadata_ms=%.1f target_write_ms=%.1f advisory_ms=%.1f total_ms=%.1f",
                     project,
+                    upstream.cache_status.casefold(),
                     evaluated.status,
+                    timings["metadata_ms"],
+                    timings["target_write_ms"],
+                    timings["advisory_ms"],
+                    (perf_counter() - project_started) * 1_000,
                 )
-                continue
+                return {"project": project, "status": "UNAVAILABLE", "advisories": evaluated.status}
 
             available_versions = _versions_in(evaluated.payload)
             missing = sorted(versions - available_versions)
@@ -561,8 +594,10 @@ def create_app(
                 fallback_minimum_age=fallback_minimum_age,
             )
             combined_overrides = dict(automatic_allows)
+            phase_started = perf_counter()
             if postgres_database:
                 combined_overrides.update(await state.active_overrides(project, requested_at))
+            timings["overrides_ms"] = (perf_counter() - phase_started) * 1_000
             filtered = request_policy.apply(
                 evaluated.payload,
                 now=requested_at,
@@ -570,49 +605,71 @@ def create_app(
                 fallback_minimum_age=fallback_minimum_age,
             )
             policy_denied = sorted((versions & available_versions) - _versions_in(filtered.payload))
+            phase_started = perf_counter()
             await artifacts.rewrite_urls(
                 project,
-                filtered.payload,
+                _selected_versions(filtered.payload, versions),
                 url_for=lambda digest, filename: f"{public_origin}/files/sha256/{digest}/{quote(filename, safe='')}",
             )
+            timings["artifact_registration_ms"] = (perf_counter() - phase_started) * 1_000
             status = "READY"
             if missing:
                 status = "VERSION_NOT_FOUND"
-                denied = True
             elif vulnerable:
                 status = "VULNERABLE"
-                denied = True
             elif policy_denied:
                 status = "POLICY_DENIED"
-                denied = True
-            results.append(
-                {
-                    "project": project,
-                    "status": status,
-                    "advisories": evaluated.status,
-                    "versions": sorted(versions),
-                    **({"missing_versions": missing} if missing else {}),
-                    **({"vulnerable_versions": vulnerable} if vulnerable else {}),
-                    **({"policy_denied_versions": policy_denied} if policy_denied else {}),
-                }
-            )
+            result = {
+                "project": project,
+                "status": status,
+                "advisories": evaluated.status,
+                "versions": sorted(versions),
+                **({"missing_versions": missing} if missing else {}),
+                **({"vulnerable_versions": vulnerable} if vulnerable else {}),
+                **({"policy_denied_versions": policy_denied} if policy_denied else {}),
+            }
             LOGGER.info(
-                "preflight.project project=%s status=%s advisory_cache=%s versions=%d",
+                "preflight.project project=%s status=%s metadata_cache=%s advisory_cache=%s versions=%d "
+                "private_lookup_ms=%.1f metadata_ms=%.1f target_write_ms=%.1f advisory_ms=%.1f "
+                "overrides_ms=%.1f artifact_registration_ms=%.1f total_ms=%.1f",
                 project,
                 status.casefold(),
+                upstream.cache_status.casefold(),
                 evaluated.status,
                 len(versions),
+                timings["private_lookup_ms"],
+                timings["metadata_ms"],
+                timings["target_write_ms"],
+                timings["advisory_ms"],
+                timings["overrides_ms"],
+                timings["artifact_registration_ms"],
+                (perf_counter() - project_started) * 1_000,
             )
+            return result
+
+        semaphore = asyncio.Semaphore(PREFLIGHT_CONCURRENCY)
+
+        async def evaluate_bounded(project: str, versions: set[str]) -> dict[str, Any]:
+            async with semaphore:
+                return await evaluate_project(project, versions)
+
+        results = list(
+            await asyncio.gather(*(evaluate_bounded(project, versions) for project, versions in requested.items()))
+        )
+        unavailable = any(result["status"] == "UNAVAILABLE" for result in results)
+        denied = any(result["status"] not in {"READY", "UNAVAILABLE"} for result in results)
 
         overall = "UNAVAILABLE" if unavailable else "DENIED" if denied else "READY"
         status_code = 503 if unavailable else 409 if denied else 200
         LOGGER.info(
-            "preflight.complete status=%s projects=%d ready=%d unavailable=%d denied=%d",
+            "preflight.complete status=%s projects=%d ready=%d unavailable=%d denied=%d concurrency=%d total_ms=%.1f",
             overall.casefold(),
             len(results),
             sum(result["status"] == "READY" for result in results),
             sum(result["status"] == "UNAVAILABLE" for result in results),
             sum(result["status"] not in {"READY", "UNAVAILABLE"} for result in results),
+            PREFLIGHT_CONCURRENCY,
+            (perf_counter() - preflight_started) * 1_000,
         )
         return JSONResponse(
             {"status": overall, "projects": results},
@@ -999,6 +1056,24 @@ def _versions_in(payload: SimplePayload) -> set[str]:
         for file in files
         if isinstance(file, dict) and (version := filename_version(file.get("filename"))) is not None
     }
+
+
+def _selected_versions(payload: SimplePayload, versions: set[str]) -> SimplePayload:
+    """Retain artifacts that a locked install may select."""
+    selected = dict(payload)
+    files = payload.get("files", [])
+    selected["files"] = (
+        [
+            file
+            for file in files
+            if isinstance(file, dict)
+            and (version := filename_version(file.get("filename"))) is not None
+            and str(version) in versions
+        ]
+        if isinstance(files, list)
+        else []
+    )
+    return selected
 
 
 def _preflight_projects(raw: object) -> dict[str, set[str]]:
