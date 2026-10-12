@@ -12,6 +12,14 @@ All notable changes to Wheelguard are documented here.
   revocable repository tokens in the production runtime.
 - Proxy and verify PEP 658 metadata sidecars across the supported storage
   backends.
+- Embed bounded, version-specific changelogs from source distributions on
+  package detail pages, with safe Markdown rendering and an audited
+  administrator backfill path for existing releases.
+- Link private packages on the service landing page to detail pages that show
+  the latest version plus repository and changelog links published through
+  standard Python project metadata.
+- Handle missing project links explicitly and warn when a private repository
+  may require additional access.
 - Accept private wheel and source-distribution uploads through the PyPI legacy multipart protocol at `/upload/`, compatible with `uv publish` and Twine.
 - Require a separate `WHEELGUARD_UPLOAD_TOKEN`; repository credentials remain read-only.
 - Serve privately owned names exclusively from private artifacts, immediately and without the public release cooldown or PyPI OSV lookup.
@@ -22,6 +30,8 @@ All notable changes to Wheelguard are documented here.
 - Stream uploads into R2 with digest, size, filename, upload-field, and embedded metadata checks before publishing catalog entries.
 - Prevent private artifact replacement, public fallback for private names, and reuse of prior upstream artifact URLs after a private name is claimed.
 - Require D1 migration `0004_private_packages.sql` before deploying this release. Publishing remains disabled until `WHEELGUARD_UPLOAD_TOKEN` is configured.
+- Apply D1 migration `0005_private_project_links.sql` or PostgreSQL migration
+  `0004_private_project_links.sql` before deploying the package detail pages.
 
 ## 0.2.1 - 2026-09-07
 

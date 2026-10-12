@@ -38,6 +38,21 @@ def negotiate_content_type(accept: str | None) -> str | None:
     return max(scored)[2] if scored else None
 
 
+def html_response_media_type(accept: str | None) -> str:
+    """Use ordinary HTML for browsers while preserving the PyPI type for clients."""
+    choices = _parse_accept(accept or "*/*")
+    browser_quality = max((quality for media_type, quality in choices if media_type == "text/html"), default=0.0)
+    vendor_quality = max(
+        (
+            quality
+            for media_type, quality in choices
+            if media_type in {SIMPLE_HTML, "application/vnd.pypi.simple.latest+html"}
+        ),
+        default=0.0,
+    )
+    return "text/html" if browser_quality > vendor_quality else SIMPLE_HTML
+
+
 def render_project_html(payload: SimplePayload) -> str:
     """Render project metadata as a PEP 503-compatible HTML page."""
     raw_meta = payload.get("meta")

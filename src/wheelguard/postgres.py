@@ -289,6 +289,10 @@ class PostgresDatabase:
         size: int,
         object_key: str,
         requires_python: str | None,
+        repository_url: str | None,
+        changelog_url: str | None,
+        changelog: str | None,
+        changelog_format: str | None,
         uploaded_at: datetime,
         actor: str,
     ) -> dict[str, Any] | None:
@@ -316,6 +320,46 @@ class PostgresDatabase:
                     project,
                 ),
             )
+            await connection.execute(
+                """
+                    UPDATE private_projects
+                    SET repository_url = COALESCE(%s, repository_url),
+                        changelog_url = COALESCE(%s, changelog_url)
+                    WHERE normalized_name = %s
+                        AND EXISTS (
+                            SELECT 1 FROM private_artifacts
+                            WHERE project = %s AND filename = %s AND sha256 = %s
+                        )
+                    """,
+                (repository_url, changelog_url, project, project, filename, sha256),
+            )
+            if changelog is not None and changelog_format is not None:
+                await connection.execute(
+                    """
+                    INSERT INTO private_changelogs (project, version, content, format, updated_at, updated_by)
+                    SELECT %s, %s, %s, %s, %s, %s
+                    WHERE EXISTS (
+                        SELECT 1 FROM private_artifacts
+                        WHERE project = %s AND filename = %s AND sha256 = %s
+                    )
+                    ON CONFLICT(project, version) DO UPDATE SET
+                        content = excluded.content,
+                        format = excluded.format,
+                        updated_at = excluded.updated_at,
+                        updated_by = excluded.updated_by
+                    """,
+                    (
+                        project,
+                        version,
+                        changelog,
+                        changelog_format,
+                        uploaded_at,
+                        actor,
+                        project,
+                        filename,
+                        sha256,
+                    ),
+                )
             await connection.execute(
                 """
                     UPDATE private_projects SET claimed_at = %s WHERE normalized_name = %s AND claimed_at IS NULL
@@ -351,6 +395,70 @@ class PostgresDatabase:
                 (project,),
             )
             return list(await result.fetchall())
+
+    async def private_project_versions(self) -> list[dict[str, Any]]:
+        """List every published version for claimed private projects."""
+        async with self._connection() as connection:
+            result = await connection.execute(
+                """
+                SELECT p.normalized_name, a.version
+                FROM private_projects p
+                JOIN private_artifacts a ON a.project = p.normalized_name
+                WHERE p.claimed_at IS NOT NULL
+                ORDER BY p.normalized_name, a.version
+                """
+            )
+            return list(await result.fetchall())
+
+    async def private_changelog(self, project: str, version: str) -> dict[str, Any] | None:
+        """Return the embedded changelog for one private release."""
+        async with self._connection() as connection:
+            result = await connection.execute(
+                "SELECT content, format, updated_at, updated_by FROM private_changelogs "
+                "WHERE project = %s AND version = %s",
+                (project, version),
+            )
+            return await result.fetchone()
+
+    async def set_private_changelog(
+        self,
+        project: str,
+        version: str,
+        content: str,
+        changelog_format: str,
+        actor: str,
+        occurred_at: datetime,
+    ) -> bool:
+        """Upsert a bounded changelog for an existing release and audit it."""
+        from uuid import uuid4
+
+        async with self._connection() as connection, connection.transaction():
+            changed = await connection.execute(
+                """
+                INSERT INTO private_changelogs (project, version, content, format, updated_at, updated_by)
+                SELECT %s, %s, %s, %s, %s, %s
+                WHERE EXISTS (SELECT 1 FROM private_artifacts WHERE project = %s AND version = %s)
+                ON CONFLICT(project, version) DO UPDATE SET
+                    content = excluded.content,
+                    format = excluded.format,
+                    updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by
+                """,
+                (project, version, content, changelog_format, occurred_at, actor, project, version),
+            )
+            if changed.rowcount != 1:
+                return False
+            await connection.execute(
+                "INSERT INTO policy_audit (id, event_type, actor, occurred_at, details) "
+                "VALUES (%s, 'private.changelog-updated', %s, %s, %s)",
+                (
+                    uuid4(),
+                    actor,
+                    occurred_at,
+                    Jsonb({"project": project, "version": version, "format": changelog_format}),
+                ),
+            )
+            return True
 
     async def private_artifact(self, digest: str, filename: str) -> dict[str, Any] | None:
         async with self._connection() as connection:

@@ -13,6 +13,7 @@ from workers import Response, fetch
 from wheelguard.auth import TokenAuthenticator
 from wheelguard.cloudflare_index import _body_response, _error, _json_response, _log, _python, _timestamp
 from wheelguard.distributions import validate_distribution
+from wheelguard.project_metadata import project_links
 from wheelguard.simple_api import SIMPLE_JSON, negotiate_content_type, render_project_html
 from wheelguard.upload_form import UploadError, receive_upload
 
@@ -113,15 +114,16 @@ class PrivatePackages:
         try:
             form = await receive_upload(request, self.bucket, key, self.repository._settings.maximum_artifact_bytes)
             completed = True
-            name, version, requires_python = await validate_distribution(self.bucket, key, form)
+            metadata = await validate_distribution(self.bucket, key, form)
+            name, version, requires_python = metadata.name, metadata.version, metadata.requires_python
+            repository_url, changelog_url = project_links(form.fields)
             target = urlsplit(request.url)
             await self._claimable(name, f"{target.scheme}://{target.netloc}")
             now = _timestamp(datetime.now(UTC))
             digest = form.hash.hexdigest()
             commit_attempted = True
-            await self.db.batch(
-                [
-                    self.db.prepare("""
+            statements = [
+                self.db.prepare("""
                     INSERT INTO private_artifacts
                         (project, filename, version, sha256, size, object_key, requires_python, uploaded_at)
                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
@@ -129,23 +131,59 @@ class PrivatePackages:
                         AND (collisions = '[]' OR approved_at IS NOT NULL OR claimed_at IS NOT NULL)
                     ON CONFLICT(project, filename) DO NOTHING
                 """).bind(name, form.filename, version, digest, form.size, key, requires_python, now),
-                    self.db.prepare("""
+                self.db.prepare("""
                     UPDATE private_projects SET claimed_at = ?2
                     WHERE normalized_name = ?1 AND claimed_at IS NULL
                         AND EXISTS (SELECT 1 FROM private_artifacts WHERE project = ?1)
                 """).bind(name, now),
+                self.db.prepare("""
+                    UPDATE private_projects
+                    SET repository_url = COALESCE(?2, repository_url),
+                        changelog_url = COALESCE(?3, changelog_url)
+                    WHERE normalized_name = ?1
+                        AND EXISTS (
+                            SELECT 1 FROM private_artifacts
+                            WHERE project = ?1 AND filename = ?4 AND sha256 = ?5
+                        )
+                """).bind(name, repository_url, changelog_url, form.filename, digest),
+            ]
+            if metadata.changelog is not None:
+                statements.append(
                     self.db.prepare("""
+                    INSERT INTO private_changelogs (project, version, content, format, updated_at, updated_by)
+                    SELECT ?1, ?2, ?3, ?4, ?5, 'publisher'
+                    WHERE EXISTS (
+                        SELECT 1 FROM private_artifacts
+                        WHERE project = ?1 AND filename = ?6 AND sha256 = ?7
+                    )
+                    ON CONFLICT(project, version) DO UPDATE SET
+                        content = excluded.content,
+                        format = excluded.format,
+                        updated_at = excluded.updated_at,
+                        updated_by = excluded.updated_by
+                """).bind(
+                        name,
+                        version,
+                        metadata.changelog.content,
+                        metadata.changelog.format,
+                        now,
+                        form.filename,
+                        digest,
+                    )
+                )
+            statements.append(
+                self.db.prepare("""
                     INSERT INTO policy_audit (id, event_type, actor, occurred_at, details)
                     SELECT ?1, 'private.uploaded', 'publisher', ?2, ?3
                     WHERE EXISTS (SELECT 1 FROM private_artifacts WHERE object_key = ?4)
                 """).bind(
-                        str(uuid4()),
-                        now,
-                        json.dumps({"project": name, "filename": form.filename, "sha256": digest}),
-                        key,
-                    ),
-                ]
+                    str(uuid4()),
+                    now,
+                    json.dumps({"project": name, "filename": form.filename, "sha256": digest}),
+                    key,
+                )
             )
+            await self.db.batch(statements)
             saved = _python(
                 await self.db.prepare(
                     "SELECT sha256, object_key FROM private_artifacts WHERE project = ?1 AND filename = ?2"

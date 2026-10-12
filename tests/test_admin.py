@@ -2,7 +2,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from wheelguard.admin import InvalidOverrideError, admin_content_security_policy, parse_override_request
+from wheelguard.admin import (
+    InvalidOverrideError,
+    admin_content_security_policy,
+    parse_changelog_request,
+    parse_override_request,
+)
 
 
 def test_admin_content_security_policy_allows_same_origin_api() -> None:
@@ -31,6 +36,16 @@ def test_parse_override_request_normalizes_release() -> None:
     assert result.version == "1.0.0"
     assert result.action == "allow"
     assert result.expires_at is not None and result.expires_at.endswith("Z")
+
+
+def test_parse_changelog_request_normalizes_version_and_bounds_content() -> None:
+    result = parse_changelog_request({"version": "1.0.0", "content": "# Changes\n", "format": "markdown"})
+
+    assert result.version == "1.0.0"
+    assert result.content == "# Changes\n"
+
+    with pytest.raises(ValueError, match="256 KiB"):
+        parse_changelog_request({"version": "1.0", "content": "x" * (256 * 1024 + 1)})
 
 
 @pytest.mark.parametrize(

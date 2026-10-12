@@ -5,7 +5,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from wheelguard.application import create_app
+from wheelguard.application import _render_landing_page, _render_package_page, create_app
 from wheelguard.config import Settings
 from wheelguard.database import Database
 from wheelguard.models import AdvisoryResult, ProjectRepository, ProjectResponse, SimplePayload, UpstreamNotFoundError
@@ -63,6 +63,7 @@ class AdminDatabase(Database):
     """Record administrator writes without requiring PostgreSQL in a route test."""
 
     actor: str | None = None
+    changelog: tuple[str, str, str, str] | None = None
 
     async def settings(self) -> dict[str, str]:
         return {}
@@ -71,6 +72,20 @@ class AdminDatabase(Database):
         assert updates == {"minimum_age_days": 10}
         assert occurred_at.tzinfo is not None
         self.actor = actor
+
+    async def set_private_changelog(
+        self,
+        project: str,
+        version: str,
+        content: str,
+        changelog_format: str,
+        actor: str,
+        occurred_at: datetime,
+    ) -> bool:
+        assert occurred_at.tzinfo is not None
+        self.changelog = (project, version, content, changelog_format)
+        self.actor = actor
+        return True
 
 
 class VulnerableOldRelease:
@@ -96,6 +111,50 @@ def make_app(repository: ProjectRepository, data_dir: Path) -> FastAPI:
         repository=repository,
         clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
     )
+
+
+def test_landing_page_lists_internal_packages_and_current_versions() -> None:
+    landing = _render_landing_page(
+        [("private-flight", "2.1"), ("escaped-name", "1.0")],
+        public_origin="https://packages.example",
+        documentation_url="https://docs.example/wheelguard/",
+    )
+
+    assert '<li><a href="/packages/private-flight/">private-flight</a><span>2.1</span></li>' in landing
+    assert '<li><a href="/packages/escaped-name/">escaped-name</a><span>1.0</span></li>' in landing
+    assert "https://packages.example/simple/" in landing
+    assert "https://docs.example/wheelguard/" in landing
+
+
+def test_package_page_embeds_safe_markdown_changelog() -> None:
+    page = _render_package_page(
+        {
+            "name": "private-flight",
+            "version": "2.1",
+            "repository_url": "https://gitlab.example/acx/flight",
+            "changelog_url": "https://gitlab.example/acx/flight/-/blob/main/CHANGELOG.md",
+            "changelog": {
+                "content": "# Changelog\n\n## 2.1\n\n- Added guidance.\n\n<script>alert(1)</script>",
+                "format": "markdown",
+            },
+        },
+        "private-flight",
+    )
+
+    assert "Latest version: <strong>2.1</strong>" in page
+    assert "<li>Added guidance.</li>" in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
+    assert "Source file" in page
+
+
+def test_package_page_handles_missing_changelog() -> None:
+    page = _render_package_page(
+        {"name": "private-flight", "version": "2.1", "repository_url": None, "changelog_url": None},
+        "private-flight",
+    )
+
+    assert "No changelog has been published for this version." in page
+    assert "may require additional repository access" not in page
 
 
 @pytest.fixture
@@ -135,10 +194,16 @@ async def test_html_and_normalization_redirect(tmp_path: Path) -> None:
         httpx.AsyncClient(transport=transport, base_url="http://test") as client,
     ):
         html = await client.get("/simple/demo-package/", headers={"Accept": SIMPLE_HTML})
+        browser = await client.get(
+            "/simple/demo-package/", headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+        )
         redirect = await client.get("/simple/Demo_Package/", follow_redirects=False)
     assert html.status_code == 200
     assert "demo_package-1.0" in html.text
     assert "demo_package-2.0" not in html.text
+    assert html.headers["content-type"].startswith(SIMPLE_HTML)
+    assert browser.headers["content-type"].startswith("text/html")
+    assert "Links for demo-package" in browser.text
     assert redirect.status_code == 308
     assert redirect.headers["location"].endswith("/simple/demo-package/")
 
@@ -164,10 +229,15 @@ async def test_authentication_protects_repository_but_not_health(tmp_path: Path)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as client:
         denied = await client.get("/simple/demo-package/")
         health = await client.get("/healthz")
+        landing = await client.get("/")
 
     assert denied.status_code == 401
     assert denied.headers["WWW-Authenticate"] == 'Basic realm="Wheelguard"'
     assert health.status_code == 200
+    assert landing.status_code == 200
+    assert "A policy-aware, outage-resistant path" in landing.text
+    assert "http://test/simple/" in landing.text
+    assert landing.headers["x-content-type-options"] == "nosniff"
 
 
 @pytest.mark.anyio
@@ -191,22 +261,106 @@ async def test_admin_token_is_separate_and_records_actor(tmp_path: Path) -> None
         httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="https://wheelguard.test") as client,
     ):
         denied = await client.get("/admin/")
+        login_page = await client.get("/admin/login")
         repository_denied = await client.get("/admin/", auth=httpx.BasicAuth("package", repository_token))
-        allowed = await client.get("/admin/", auth=httpx.BasicAuth("brent", admin_token))
+        invalid = await client.post(
+            "/admin/login",
+            headers={"Origin": "https://wheelguard.test"},
+            data={"username": "brent", "password": "wrong"},
+        )
+        logged_in = await client.post(
+            "/admin/login",
+            headers={"Origin": "https://wheelguard.test"},
+            data={"username": "brent", "password": admin_token},
+        )
+        session_allowed = await client.get("/admin/")
+        basic_allowed = await client.get("/admin/", auth=httpx.BasicAuth("brent", admin_token))
         updated = await client.patch(
             "/admin/api/settings",
-            auth=httpx.BasicAuth("brent", admin_token),
             headers={"Origin": "https://wheelguard.test"},
             json={"minimum_age_days": 10},
         )
+        changelog = await client.put(
+            "/admin/api/private-projects/demo-package/changelog",
+            headers={"Origin": "https://wheelguard.test"},
+            json={"version": "1.0", "content": "# Changelog\n", "format": "markdown"},
+        )
+        logged_out = await client.post("/admin/logout", headers={"Origin": "https://wheelguard.test"})
+        denied_again = await client.get("/admin/")
 
-    assert denied.status_code == 401
-    assert denied.headers["www-authenticate"] == 'Basic realm="Wheelguard administration"'
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/admin/login"
+    assert login_page.status_code == 200
+    assert 'autocomplete="username"' in login_page.text
+    assert 'autocomplete="current-password"' in login_page.text
+    assert invalid.status_code == 401
+    assert "Invalid username or password" in invalid.text
+    assert logged_in.status_code == 303
+    assert "wheelguard_admin_session=" in logged_in.headers["set-cookie"]
+    assert "HttpOnly" in logged_in.headers["set-cookie"]
+    assert "SameSite=strict" in logged_in.headers["set-cookie"]
+    assert "Secure" in logged_in.headers["set-cookie"]
+    assert session_allowed.status_code == 200
     assert repository_denied.status_code == 401
-    assert allowed.status_code == 200
-    assert "Signed in as <strong>brent</strong>" in allowed.text
+    assert basic_allowed.status_code == 200
+    assert "Signed in as <strong>brent</strong>" in session_allowed.text
     assert updated.status_code == 200
+    assert changelog.status_code == 200
+    assert database.changelog == ("demo-package", "1.0", "# Changelog\n", "markdown")
+    assert logged_out.status_code == 303
+    assert denied_again.status_code == 303
     assert database.actor == "brent"
+
+
+@pytest.mark.anyio
+async def test_admin_login_uses_configured_public_origin_behind_proxy(tmp_path: Path) -> None:
+    application = create_app(
+        settings=Settings(
+            data_dir=tmp_path,
+            database_url="host=postgres.invalid dbname=wheelguard",
+            public_url="https://packages.example",
+            admin_token="a" * 32,
+            admin_token_actor="brent",
+        ),
+        repository=FakeRepository(),
+        database=AdminDatabase(tmp_path / "proxy-admin.db"),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://internal-container"
+    ) as client:
+        response = await client.post(
+            "/admin/login",
+            headers={"Origin": "https://packages.example"},
+            data={"username": "brent", "password": "a" * 32},
+        )
+
+    assert response.status_code == 303
+    assert "Secure" in response.headers["set-cookie"]
+
+
+@pytest.mark.anyio
+async def test_admin_path_redirect_stays_relative_behind_proxy(tmp_path: Path) -> None:
+    application = create_app(
+        settings=Settings(
+            data_dir=tmp_path,
+            database_url="host=postgres.invalid dbname=wheelguard",
+            public_url="https://packages.example",
+            admin_token="a" * 32,
+            admin_token_actor="brent",
+        ),
+        repository=FakeRepository(),
+        database=AdminDatabase(tmp_path / "proxy-admin-path.db"),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://internal-container"
+    ) as client:
+        no_slash = await client.get("/admin")
+        with_slash = await client.get("/admin/")
+
+    assert no_slash.status_code == 308
+    assert no_slash.headers["location"] == "/admin/"
+    assert with_slash.status_code == 303
+    assert with_slash.headers["location"] == "/admin/login"
 
 
 @pytest.mark.anyio

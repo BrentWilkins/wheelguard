@@ -28,6 +28,7 @@ class Settings:
 
     upstream_url: str = "https://pypi.org/simple/"
     public_url: str | None = None
+    documentation_url: str | None = None
     minimum_age: timedelta = timedelta(days=14)
     fallback_minimum_age: timedelta = timedelta(hours=24)
     upstream_timeout_seconds: float = 30.0
@@ -76,6 +77,15 @@ class Settings:
                 or public.fragment
             ):
                 raise ValueError("WHEELGUARD_PUBLIC_URL must be an HTTP(S) origin without credentials or a path")
+        if self.documentation_url is not None:
+            documentation = urlsplit(self.documentation_url)
+            if (
+                documentation.scheme not in {"http", "https"}
+                or not documentation.hostname
+                or documentation.username is not None
+                or documentation.password is not None
+            ):
+                raise ValueError("WHEELGUARD_DOCUMENTATION_URL must be an HTTP(S) URL without credentials")
         if not self.allowed_artifact_hosts:
             raise ValueError("WHEELGUARD_ALLOWED_ARTIFACT_HOSTS cannot be empty")
         if self.osv_enabled:
@@ -98,6 +108,7 @@ class Settings:
         return cls(
             upstream_url=os.getenv("WHEELGUARD_UPSTREAM_URL", "https://pypi.org/simple/"),
             public_url=os.getenv("WHEELGUARD_PUBLIC_URL") or None,
+            documentation_url=os.getenv("WHEELGUARD_DOCUMENTATION_URL") or None,
             minimum_age=timedelta(days=_integer("WHEELGUARD_MINIMUM_AGE_DAYS", "14")),
             fallback_minimum_age=timedelta(hours=_integer("WHEELGUARD_FALLBACK_MINIMUM_AGE_HOURS", "24")),
             upstream_timeout_seconds=float(os.getenv("WHEELGUARD_UPSTREAM_TIMEOUT", "30")),
@@ -116,7 +127,7 @@ class Settings:
             auth_tokens=tuple(
                 token.strip() for token in os.getenv("WHEELGUARD_AUTH_TOKENS", "").split(",") if token.strip()
             ),
-            admin_token=os.getenv("WHEELGUARD_ADMIN_TOKEN") or None,
+            admin_token=(os.getenv("WHEELGUARD_ADMIN_TOKEN") or "").strip() or None,
             admin_token_actor=os.getenv("WHEELGUARD_ADMIN_TOKEN_ACTOR", "temporary-admin").strip() or "temporary-admin",
             managed_token_auth_enabled=_boolean("WHEELGUARD_MANAGED_TOKEN_AUTH_ENABLED", "false"),
             database_url=os.getenv("WHEELGUARD_DATABASE_URL") or None,

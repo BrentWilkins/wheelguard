@@ -28,6 +28,13 @@ def test_loads_additional_authentication_tokens(monkeypatch: pytest.MonkeyPatch)
     assert Settings.from_environment().auth_tokens == ("a" * 32, "b" * 32)
 
 
+def test_strips_secret_file_newline_from_admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "a" * 64
+    monkeypatch.setenv("WHEELGUARD_ADMIN_TOKEN", f"{token}\n")
+
+    assert Settings.from_environment().admin_token == token
+
+
 def test_database_application_principal_requires_object_id(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WHEELGUARD_DATABASE_APP_PRINCIPAL", "wheelguard-app")
 
@@ -45,9 +52,17 @@ def test_loads_database_application_principal_object_id(monkeypatch: pytest.Monk
     assert settings.database_app_object_id == "00000000-0000-0000-0000-000000000001"
 
 
+def test_loads_public_documentation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WHEELGUARD_DOCUMENTATION_URL", "https://docs.example/wheelguard/")
+
+    assert Settings.from_environment().documentation_url == "https://docs.example/wheelguard/"
+
+
 def test_rejects_insecure_upstream_and_empty_artifact_allowlist() -> None:
     """Keep self-hosted network destinations explicit and encrypted."""
     with pytest.raises(ValueError, match="HTTPS URL"):
         Settings(upstream_url="http://pypi.example/simple/")
     with pytest.raises(ValueError, match="cannot be empty"):
         Settings(allowed_artifact_hosts=frozenset())
+    with pytest.raises(ValueError, match="DOCUMENTATION_URL"):
+        Settings(documentation_url="file:///tmp/guide")

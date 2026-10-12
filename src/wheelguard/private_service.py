@@ -10,10 +10,12 @@ from uuid import uuid4
 
 import httpx
 from fastapi import Request
+from packaging.version import Version
 
 from wheelguard.azure_storage import AzureBlobBucket, upload_request_adapter
 from wheelguard.distributions import validate_distribution
 from wheelguard.identity import GitLabOidcValidator, PublisherIdentity, authorization_token
+from wheelguard.project_metadata import project_links
 from wheelguard.upload_form import UploadError, receive_upload
 
 
@@ -50,7 +52,9 @@ class PrivatePackageService:
         try:
             form = await receive_upload(upload_request_adapter(request), self._bucket, key, self._maximum_bytes)
             completed = True
-            name, version, requires_python = await validate_distribution(self._bucket, key, form)
+            metadata = await validate_distribution(self._bucket, key, form)
+            name, version, requires_python = metadata.name, metadata.version, metadata.requires_python
+            repository_url, changelog_url = project_links(form.fields)
             await self._claimable(name, str(request.base_url).rstrip("/"))
             digest = form.hash.hexdigest()
             commit_attempted = True
@@ -62,6 +66,10 @@ class PrivatePackageService:
                 size=form.size,
                 object_key=key,
                 requires_python=requires_python,
+                repository_url=repository_url,
+                changelog_url=changelog_url,
+                changelog=metadata.changelog.content if metadata.changelog else None,
+                changelog_format=metadata.changelog.format if metadata.changelog else None,
                 uploaded_at=datetime.now(UTC),
                 actor=f"gitlab:{identity.project_path}:{identity.subject}",
             )
@@ -80,6 +88,32 @@ class PrivatePackageService:
     async def owns(self, name: str) -> bool:
         row = await self._database.private_project(name)
         return bool(row and row.get("claimed_at"))
+
+    async def catalog(self) -> list[tuple[str, str]]:
+        """Return claimed private projects with their newest published version."""
+        newest: dict[str, Version] = {}
+        for row in await self._database.private_project_versions():
+            name, version = row["normalized_name"], Version(row["version"])
+            if name not in newest or version > newest[name]:
+                newest[name] = version
+        return [(name, str(newest[name])) for name in sorted(newest)]
+
+    async def details(self, name: str) -> dict[str, object] | None:
+        """Return non-sensitive catalog details for a claimed project."""
+        row = await self._database.private_project(name)
+        if row is None or row.get("claimed_at") is None:
+            return None
+        version = next((version for project, version in await self.catalog() if project == name), None)
+        if version is None:
+            return None
+        changelog = await self._database.private_changelog(name, version)
+        return {
+            "name": name,
+            "version": version,
+            "repository_url": row.get("repository_url"),
+            "changelog_url": row.get("changelog_url"),
+            "changelog": changelog,
+        }
 
     async def listing(self, project: str, base_url: str) -> dict[str, object]:
         rows = await self._database.private_artifacts(project)
