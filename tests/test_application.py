@@ -63,6 +63,7 @@ class AdminDatabase(Database):
     """Record administrator writes without requiring PostgreSQL in a route test."""
 
     actor: str | None = None
+    changelog: tuple[str, str, str, str] | None = None
 
     async def settings(self) -> dict[str, str]:
         return {}
@@ -71,6 +72,20 @@ class AdminDatabase(Database):
         assert updates == {"minimum_age_days": 10}
         assert occurred_at.tzinfo is not None
         self.actor = actor
+
+    async def set_private_changelog(
+        self,
+        project: str,
+        version: str,
+        content: str,
+        changelog_format: str,
+        actor: str,
+        occurred_at: datetime,
+    ) -> bool:
+        assert occurred_at.tzinfo is not None
+        self.changelog = (project, version, content, changelog_format)
+        self.actor = actor
+        return True
 
 
 class VulnerableOldRelease:
@@ -111,20 +126,25 @@ def test_landing_page_lists_internal_packages_and_current_versions() -> None:
     assert "https://docs.example/wheelguard/" in landing
 
 
-def test_package_page_links_changelog_and_explains_private_gitlab_access() -> None:
+def test_package_page_embeds_safe_markdown_changelog() -> None:
     page = _render_package_page(
         {
             "name": "private-flight",
             "version": "2.1",
             "repository_url": "https://gitlab.example/acx/flight",
             "changelog_url": "https://gitlab.example/acx/flight/-/blob/main/CHANGELOG.md",
+            "changelog": {
+                "content": "# Changelog\n\n## 2.1\n\n- Added guidance.\n\n<script>alert(1)</script>",
+                "format": "markdown",
+            },
         },
         "private-flight",
     )
 
     assert "Latest version: <strong>2.1</strong>" in page
-    assert "Open changelog" in page
-    assert "may require additional repository access" in page
+    assert "<li>Added guidance.</li>" in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
+    assert "Source file" in page
 
 
 def test_package_page_handles_missing_changelog() -> None:
@@ -133,7 +153,8 @@ def test_package_page_handles_missing_changelog() -> None:
         "private-flight",
     )
 
-    assert "No changelog link has been published yet." in page
+    assert "No changelog has been published for this version." in page
+    assert "may require additional repository access" not in page
 
 
 @pytest.fixture
@@ -259,6 +280,11 @@ async def test_admin_token_is_separate_and_records_actor(tmp_path: Path) -> None
             headers={"Origin": "https://wheelguard.test"},
             json={"minimum_age_days": 10},
         )
+        changelog = await client.put(
+            "/admin/api/private-projects/demo-package/changelog",
+            headers={"Origin": "https://wheelguard.test"},
+            json={"version": "1.0", "content": "# Changelog\n", "format": "markdown"},
+        )
         logged_out = await client.post("/admin/logout", headers={"Origin": "https://wheelguard.test"})
         denied_again = await client.get("/admin/")
 
@@ -279,6 +305,8 @@ async def test_admin_token_is_separate_and_records_actor(tmp_path: Path) -> None
     assert basic_allowed.status_code == 200
     assert "Signed in as <strong>brent</strong>" in session_allowed.text
     assert updated.status_code == 200
+    assert changelog.status_code == 200
+    assert database.changelog == ("demo-package", "1.0", "# Changelog\n", "markdown")
     assert logged_out.status_code == 303
     assert denied_again.status_code == 303
     assert database.actor == "brent"

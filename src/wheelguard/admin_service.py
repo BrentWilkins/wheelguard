@@ -8,7 +8,7 @@ from uuid import UUID
 
 from packaging.utils import canonicalize_name
 
-from wheelguard.admin import parse_override_request
+from wheelguard.admin import parse_changelog_request, parse_override_request
 from wheelguard.runtime_settings import SETTING_DEFINITIONS, parse_settings_update, setting_catalog
 
 
@@ -70,6 +70,24 @@ class AdminService:
         if not await self._database.approve_private_project(name, actor, datetime.now(UTC)):
             raise KeyError("No pending public name collision for this project")
         return await self.private_projects()
+
+    async def set_private_changelog(self, name: str, body: Any, actor: str) -> dict[str, object]:
+        """Store a reviewed changelog snapshot for an existing private release."""
+        try:
+            normalized = canonicalize_name(name, validate=True)
+        except ValueError as error:
+            raise ValueError("Invalid package name") from error
+        request = parse_changelog_request(body)
+        if not await self._database.set_private_changelog(
+            normalized,
+            request.version,
+            request.content,
+            request.format,
+            actor,
+            datetime.now(UTC),
+        ):
+            raise KeyError("Published package version not found")
+        return {"project": normalized, "version": request.version, "format": request.format}
 
 
 def _json_times(row: dict[str, Any]) -> dict[str, object]:

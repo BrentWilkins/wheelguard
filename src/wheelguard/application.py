@@ -9,11 +9,12 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from inspect import isawaitable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from markdown_it import MarkdownIt
 from packaging.utils import canonicalize_name
 from starlette.middleware.base import RequestResponseEndpoint
 
@@ -728,6 +729,20 @@ def create_app(
         except ValueError as error:
             return JSONResponse({"detail": str(error)}, status_code=422)
 
+    @application.put("/admin/api/private-projects/{name}/changelog")
+    async def admin_set_private_changelog(name: str, request: Request) -> Response:
+        try:
+            actor, service = administrator(request)
+            _same_origin(request, configured.public_url)
+            body = await _json_body(request, maximum_bytes=300 * 1024)
+            return JSONResponse(await service.set_private_changelog(name, body, actor))
+        except IdentityError as error:
+            return admin_denied(error)
+        except KeyError as error:
+            return JSONResponse({"detail": str(error.args[0])}, status_code=404)
+        except ValueError as error:
+            return JSONResponse({"detail": str(error)}, status_code=422)
+
     return application
 
 
@@ -838,7 +853,7 @@ def _catalog_page_headers() -> dict[str, str]:
     }
 
 
-def _render_package_page(details: dict[str, str | None] | None, name: str) -> str:
+def _render_package_page(details: dict[str, object] | None, name: str) -> str:
     """Render package context while links fail gracefully behind GitLab auth."""
     escaped_name = html.escape(name)
     if details is None:
@@ -849,21 +864,28 @@ def _render_package_page(details: dict[str, str | None] | None, name: str) -> st
         repository_url = details.get("repository_url")
         changelog_url = details.get("changelog_url")
         repository = (
-            f'<a href="{html.escape(repository_url, quote=True)}" rel="noreferrer">Open repository →</a>'
+            f'<a href="{html.escape(str(repository_url), quote=True)}" rel="noreferrer">Open repository →</a>'
             if repository_url
             else "Repository link not published."
         )
-        changelog = (
-            f'<a href="{html.escape(changelog_url, quote=True)}" rel="noreferrer">Open changelog →</a>'
-            if changelog_url
-            else "No changelog link has been published yet."
-        )
+        changelog_record = details.get("changelog")
+        if isinstance(changelog_record, dict) and isinstance(changelog_record.get("content"), str):
+            changelog = _render_changelog(changelog_record["content"], changelog_record.get("format"))
+            if changelog_url:
+                changelog += (
+                    f'<p><a href="{html.escape(str(changelog_url), quote=True)}" rel="noreferrer">Source file →</a></p>'
+                )
+        elif changelog_url:
+            changelog = (
+                f'<p><a href="{html.escape(str(changelog_url), quote=True)}" rel="noreferrer">Open changelog →</a></p>'
+                '<p class="note">This link may require additional repository access.</p>'
+            )
+        else:
+            changelog = "<p>No changelog has been published for this version.</p>"
         body = (
             f'<p><a href="/">← All packages</a></p><h1>{escaped_name}</h1>'
             f'<p class="version">Latest version: <strong>{version}</strong></p>'
-            f"<section><h2>Changelog</h2><p>{changelog}</p>"
-            '<p class="note">This link may require additional repository access. '
-            "If access is denied, contact the package owner.</p></section>"
+            f'<section class="changelog"><h2>Changelog</h2>{changelog}</section>'
             f"<section><h2>Source</h2><p>{repository}</p></section>"
         )
         title = f"{escaped_name} {version} · Wheelguard"
@@ -873,7 +895,16 @@ def _render_package_page(details: dict[str, str | None] | None, name: str) -> st
 :root{{color-scheme:light dark}}body{{font:16px/1.6 system-ui;max-width:52rem;margin:8vh auto;padding:0 1.25rem}}
 h1{{font-size:clamp(2rem,6vw,3.5rem);line-height:1.1}}section{{border-top:1px solid GrayText;margin-top:2rem;padding-top:1rem}}
 a{{color:LinkText}}.version{{font-size:1.2rem}}.note{{color:GrayText;max-width:42rem}}
+.changelog pre{{overflow:auto;padding:1rem;border:1px solid GrayText;border-radius:.4rem}}
+.changelog code{{font-size:.9em}}.changelog h1{{font-size:1.8rem}}.changelog h2{{font-size:1.35rem}}
 </style></head><body>{body}</body></html>"""
+
+
+def _render_changelog(content: str, changelog_format: object) -> str:
+    """Render stored Markdown without raw HTML; show other text formats verbatim."""
+    if changelog_format == "markdown":
+        return cast(str, MarkdownIt("commonmark", {"html": False, "linkify": False}).render(content))
+    return f"<pre>{html.escape(content)}</pre>"
 
 
 _ADMIN_LOGIN_PAGE = """<!doctype html>

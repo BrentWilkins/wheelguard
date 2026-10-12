@@ -12,6 +12,38 @@ class InvalidOverrideError(ValueError):
     """Indicate that an override request is malformed."""
 
 
+CHANGELOG_LIMIT = 256 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ChangelogRequest:
+    """Describe a bounded changelog snapshot for one published version."""
+
+    version: str
+    content: str
+    format: str
+
+
+def parse_changelog_request(raw: Any) -> ChangelogRequest:
+    """Validate an administrator-supplied release changelog snapshot."""
+    if not isinstance(raw, dict):
+        raise ValueError("Request body must be a JSON object")
+    version, content, changelog_format = raw.get("version"), raw.get("content"), raw.get("format", "markdown")
+    if not isinstance(version, str):
+        raise ValueError("version is required")
+    try:
+        normalized_version = str(Version(version.strip()))
+    except InvalidVersion as error:
+        raise ValueError("version is not a valid Python package version") from error
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("content is required")
+    if len(content.encode("utf-8")) > CHANGELOG_LIMIT:
+        raise ValueError("content must be 256 KiB or smaller")
+    if changelog_format not in {"markdown", "rst", "text"}:
+        raise ValueError("format must be markdown, rst, or text")
+    return ChangelogRequest(normalized_version, content, changelog_format)
+
+
 def admin_content_security_policy(nonce: str) -> str:
     """Return the administrator page policy, including same-origin API access."""
     return (

@@ -6,7 +6,8 @@ import struct
 import tarfile
 import zipfile
 import zlib
-from contextlib import aclosing
+from contextlib import aclosing, suppress
+from dataclasses import dataclass
 from email import policy
 from email.parser import BytesParser
 from typing import Any
@@ -18,6 +19,43 @@ from packaging.version import InvalidVersion, Version
 from wheelguard.upload_form import CHUNK_SIZE, UploadError, UploadForm, stream_bytes
 
 METADATA_LIMIT = 1024 * 1024
+CHANGELOG_LIMIT = 256 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ChangelogSnapshot:
+    """Hold bounded release notes captured from a source distribution."""
+
+    content: str
+    format: str
+
+
+@dataclass(frozen=True, slots=True)
+class DistributionMetadata:
+    """Describe validated identity and optional human-facing release notes."""
+
+    name: str
+    version: str
+    requires_python: str | None
+    changelog: ChangelogSnapshot | None
+
+
+def _changelog_format(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) != 2:
+        return None
+    names = {
+        "changelog.md": "markdown",
+        "changes.md": "markdown",
+        "history.md": "markdown",
+        "release-notes.md": "markdown",
+        "changelog.rst": "rst",
+        "changes.rst": "rst",
+        "history.rst": "rst",
+        "changelog.txt": "text",
+        "changes.txt": "text",
+    }
+    return names.get(parts[1].casefold())
 
 
 async def _range(bucket: Any, key: str, offset: int, length: int) -> bytes:
@@ -33,7 +71,40 @@ async def _range(bucket: Any, key: str, offset: int, length: int) -> bytes:
     return result
 
 
-async def _zip_metadata(bucket: Any, key: str, size: int, *, wheel: bool) -> bytes:
+async def _zip_member(bucket: Any, key: str, directory_offset: int, info: zipfile.ZipInfo, limit: int) -> bytes:
+    """Read and verify one bounded member described by a ZIP central directory."""
+    offset = info.header_offset + directory_offset
+    if info.file_size > limit or info.compress_size > limit or info.flag_bits & 1:
+        raise UploadError("Invalid or oversized distribution metadata")
+    header = await _range(bucket, key, offset, 30)
+    if header[:4] != b"PK\x03\x04":
+        raise UploadError("Invalid ZIP metadata header")
+    name_size, extra_size = struct.unpack("<HH", header[26:30])
+    start = offset + 30 + name_size + extra_size
+    if start + info.compress_size > directory_offset:
+        raise UploadError("Invalid ZIP metadata offset")
+    member_name = await _range(bucket, key, offset + 30, name_size)
+    if member_name != info.filename.encode("utf-8" if info.flag_bits & 0x800 else "cp437"):
+        raise UploadError("ZIP local and central metadata filenames differ")
+    compressed = await _range(bucket, key, start, info.compress_size)
+    if info.compress_type == zipfile.ZIP_STORED:
+        content = compressed
+    elif info.compress_type == zipfile.ZIP_DEFLATED:
+        try:
+            decoder = zlib.decompressobj(-15)
+            content = decoder.decompress(compressed, limit + 1)
+            if not decoder.eof or decoder.unused_data:
+                raise UploadError("Invalid compressed metadata")
+        except zlib.error as error:
+            raise UploadError("Invalid compressed metadata") from error
+    else:
+        raise UploadError("Unsupported ZIP metadata compression")
+    if len(content) != info.file_size or zlib.crc32(content) != info.CRC:
+        raise UploadError("Distribution metadata checksum mismatch")
+    return content
+
+
+async def _zip_metadata(bucket: Any, key: str, size: int, *, wheel: bool) -> tuple[bytes, ChangelogSnapshot | None]:
     # Fetch only the central directory and the metadata member. zipfile parses a
     # small synthetic archive; offsets are adjusted back to the original object.
     tail_offset = max(0, size - 65_557)
@@ -66,38 +137,20 @@ async def _zip_metadata(bucket: Any, key: str, size: int, *, wheel: bool) -> byt
             ]
             if len(candidates) != 1:
                 raise UploadError("Distribution must contain exactly one top-level metadata file")
-            info = candidates[0]
-            offset = info.header_offset + directory_offset
+            metadata_info = candidates[0]
+            changelog_info = next(
+                (info for info in archive.infolist() if not wheel and _changelog_format(info.filename)),
+                None,
+            )
     except (zipfile.BadZipFile, ValueError) as error:
         raise UploadError("Invalid ZIP distribution") from error
-    if info.file_size > METADATA_LIMIT or info.compress_size > METADATA_LIMIT or info.flag_bits & 1:
-        raise UploadError("Invalid or oversized distribution metadata")
-    header = await _range(bucket, key, offset, 30)
-    if header[:4] != b"PK\x03\x04":
-        raise UploadError("Invalid ZIP metadata header")
-    name_size, extra_size = struct.unpack("<HH", header[26:30])
-    start = offset + 30 + name_size + extra_size
-    if start + info.compress_size > directory_offset:
-        raise UploadError("Invalid ZIP metadata offset")
-    member_name = await _range(bucket, key, offset + 30, name_size)
-    if member_name != info.filename.encode("utf-8" if info.flag_bits & 0x800 else "cp437"):
-        raise UploadError("ZIP local and central metadata filenames differ")
-    compressed = await _range(bucket, key, start, info.compress_size)
-    if info.compress_type == zipfile.ZIP_STORED:
-        content = compressed
-    elif info.compress_type == zipfile.ZIP_DEFLATED:
-        try:
-            decoder = zlib.decompressobj(-15)
-            content = decoder.decompress(compressed, METADATA_LIMIT + 1)
-            if not decoder.eof or decoder.unused_data:
-                raise UploadError("Invalid compressed metadata")
-        except zlib.error as error:
-            raise UploadError("Invalid compressed metadata") from error
-    else:
-        raise UploadError("Unsupported ZIP metadata compression")
-    if len(content) != info.file_size or zlib.crc32(content) != info.CRC:
-        raise UploadError("Distribution metadata checksum mismatch")
-    return content
+    metadata = await _zip_member(bucket, key, directory_offset, metadata_info, METADATA_LIMIT)
+    changelog = None
+    if changelog_info is not None and changelog_info.file_size <= CHANGELOG_LIMIT:
+        raw = await _zip_member(bucket, key, directory_offset, changelog_info, CHANGELOG_LIMIT)
+        with suppress(UnicodeDecodeError):
+            changelog = ChangelogSnapshot(raw.decode("utf-8"), _changelog_format(changelog_info.filename) or "text")
+    return metadata, changelog
 
 
 class _TarMetadata:
@@ -107,8 +160,10 @@ class _TarMetadata:
         self.buffer = bytearray()
         self.remaining = 0
         self.padding = 0
-        self.capture = False
+        self.capture: str | None = None
         self.metadata: bytes | None = None
+        self.changelog: ChangelogSnapshot | None = None
+        self.changelog_format: str | None = None
         self.member = bytearray()
         self.ended = False
 
@@ -117,14 +172,21 @@ class _TarMetadata:
         while self.buffer:
             if self.remaining:
                 count = min(self.remaining, len(self.buffer))
-                if self.capture:
+                if self.capture is not None:
                     self.member.extend(self.buffer[:count])
                 del self.buffer[:count]
                 self.remaining -= count
                 if self.remaining:
                     return
-                if self.capture:
+                if self.capture == "metadata":
                     self.metadata = bytes(self.member)
+                elif self.capture == "changelog":
+                    try:
+                        self.changelog = ChangelogSnapshot(
+                            bytes(self.member).decode("utf-8"), self.changelog_format or "text"
+                        )
+                    except UnicodeDecodeError:
+                        self.changelog = None
             if self.padding:
                 count = min(self.padding, len(self.buffer))
                 del self.buffer[:count]
@@ -146,17 +208,28 @@ class _TarMetadata:
                 raise UploadError("Invalid source distribution tar header") from error
             if info.size < 0:
                 raise UploadError("Invalid tar member size")
-            self.capture = info.name.endswith("/PKG-INFO") and len(info.name.split("/")) == 2
-            if self.capture and (not info.isfile() or info.size > METADATA_LIMIT or self.metadata is not None):
+            is_metadata = info.name.endswith("/PKG-INFO") and len(info.name.split("/")) == 2
+            changelog_format = _changelog_format(info.name)
+            self.capture = "metadata" if is_metadata else None
+            if is_metadata and (not info.isfile() or info.size > METADATA_LIMIT or self.metadata is not None):
                 raise UploadError("Invalid, duplicate, or oversized source metadata")
+            if (
+                self.capture is None
+                and changelog_format is not None
+                and self.changelog is None
+                and info.isfile()
+                and info.size <= CHANGELOG_LIMIT
+            ):
+                self.capture = "changelog"
+                self.changelog_format = changelog_format
             self.member.clear()
             self.remaining = info.size
             self.padding = (-info.size) % 512
-            if self.capture and not info.size:
+            if self.capture == "metadata" and not info.size:
                 raise UploadError("Empty source metadata")
 
 
-async def _tar_metadata(bucket: Any, key: str, size: int) -> bytes:
+async def _tar_metadata(bucket: Any, key: str, size: int) -> tuple[bytes, ChangelogSnapshot | None]:
     decoder = zlib.decompressobj(31)
     scanner = _TarMetadata()
     expanded = 0
@@ -181,10 +254,10 @@ async def _tar_metadata(bucket: Any, key: str, size: int) -> bytes:
         raise UploadError("Invalid gzip source distribution") from error
     if scanner.metadata is None:
         raise UploadError("Source distribution has no top-level PKG-INFO")
-    return scanner.metadata
+    return scanner.metadata, scanner.changelog
 
 
-async def validate_distribution(bucket: Any, key: str, form: UploadForm) -> tuple[str, str, str | None]:
+async def validate_distribution(bucket: Any, key: str, form: UploadForm) -> DistributionMetadata:
     """Match filename, upload fields, and embedded core metadata."""
     try:
         if form.filename.endswith(".whl"):
@@ -201,9 +274,9 @@ async def validate_distribution(bucket: Any, key: str, form: UploadForm) -> tupl
     if filetype and filetype != ("bdist_wheel" if form.filename.endswith(".whl") else "sdist"):
         raise UploadError("Upload filetype does not match distribution filename")
     if form.filename.endswith(".tar.gz"):
-        metadata = await _tar_metadata(bucket, key, form.size)
+        metadata, changelog = await _tar_metadata(bucket, key, form.size)
     else:
-        metadata = await _zip_metadata(bucket, key, form.size, wheel=form.filename.endswith(".whl"))
+        metadata, changelog = await _zip_metadata(bucket, key, form.size, wheel=form.filename.endswith(".whl"))
     message = BytesParser(policy=policy.default).parsebytes(metadata, headersonly=True)
     if message.defects:
         raise UploadError("Malformed distribution metadata")
@@ -226,4 +299,4 @@ async def validate_distribution(bucket: Any, key: str, form: UploadForm) -> tupl
             SpecifierSet(requires_python)
     except (ValueError, InvalidVersion, InvalidSpecifier) as error:
         raise UploadError("Invalid distribution core metadata") from error
-    return str(name), str(version), requires_python
+    return DistributionMetadata(str(name), str(version), requires_python, changelog)

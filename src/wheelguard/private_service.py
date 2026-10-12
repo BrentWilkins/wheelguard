@@ -52,7 +52,8 @@ class PrivatePackageService:
         try:
             form = await receive_upload(upload_request_adapter(request), self._bucket, key, self._maximum_bytes)
             completed = True
-            name, version, requires_python = await validate_distribution(self._bucket, key, form)
+            metadata = await validate_distribution(self._bucket, key, form)
+            name, version, requires_python = metadata.name, metadata.version, metadata.requires_python
             repository_url, changelog_url = project_links(form.fields)
             await self._claimable(name, str(request.base_url).rstrip("/"))
             digest = form.hash.hexdigest()
@@ -67,6 +68,8 @@ class PrivatePackageService:
                 requires_python=requires_python,
                 repository_url=repository_url,
                 changelog_url=changelog_url,
+                changelog=metadata.changelog.content if metadata.changelog else None,
+                changelog_format=metadata.changelog.format if metadata.changelog else None,
                 uploaded_at=datetime.now(UTC),
                 actor=f"gitlab:{identity.project_path}:{identity.subject}",
             )
@@ -95,7 +98,7 @@ class PrivatePackageService:
                 newest[name] = version
         return [(name, str(newest[name])) for name in sorted(newest)]
 
-    async def details(self, name: str) -> dict[str, str | None] | None:
+    async def details(self, name: str) -> dict[str, object] | None:
         """Return non-sensitive catalog details for a claimed project."""
         row = await self._database.private_project(name)
         if row is None or row.get("claimed_at") is None:
@@ -103,11 +106,13 @@ class PrivatePackageService:
         version = next((version for project, version in await self.catalog() if project == name), None)
         if version is None:
             return None
+        changelog = await self._database.private_changelog(name, version)
         return {
             "name": name,
             "version": version,
             "repository_url": row.get("repository_url"),
             "changelog_url": row.get("changelog_url"),
+            "changelog": changelog,
         }
 
     async def listing(self, project: str, base_url: str) -> dict[str, object]:

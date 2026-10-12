@@ -170,6 +170,7 @@ def distribution(
     kind: str = "whl",
     embedded_name: str | None = None,
     extra: bytes = b"",
+    changelog: bytes | None = None,
 ) -> tuple[str, bytes]:
     """Build a small valid distribution without executing a build backend."""
     metadata = (
@@ -181,11 +182,17 @@ def distribution(
             info = tarfile.TarInfo(f"{name}-{version}/PKG-INFO")
             info.size = len(metadata)
             archive.addfile(info, io.BytesIO(metadata))
+            if changelog is not None:
+                info = tarfile.TarInfo(f"{name}-{version}/CHANGELOG.md")
+                info.size = len(changelog)
+                archive.addfile(info, io.BytesIO(changelog))
         filename = f"{name}-{version}.tar.gz"
     else:
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
             member = f"{name}-{version}.dist-info/METADATA" if kind == "whl" else f"{name}-{version}/PKG-INFO"
             archive.writestr(member, metadata)
+            if changelog is not None and kind != "whl":
+                archive.writestr(f"{name}-{version}/CHANGELOG.md", changelog)
             archive.writestr("payload", extra)
         filename = f"{name}-{version}-py3-none-any.whl" if kind == "whl" else f"{name}-{version}.zip"
     return filename, buffer.getvalue()
@@ -295,6 +302,21 @@ async def test_publish_records_standard_project_links(setup: Any) -> None:
         "SELECT repository_url, changelog_url FROM private_projects WHERE normalized_name = 'private-demo'"
     ).fetchone()
     assert tuple(row) == (None, "https://gitlab.example/acx/private-demo/-/blob/main/CHANGELOG.md")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["tar.gz", "zip"])
+async def test_publish_captures_bounded_sdist_changelog(setup: Any, kind: str) -> None:
+    filename, content = distribution(kind=kind, changelog=b"# Changelog\n\n## 1.0\n\n- Initial release.\n")
+
+    assert (await setup.app.fetch(upload_request(filename, content))).status == 200
+    row = setup.db.connection.execute("SELECT project, version, content, format FROM private_changelogs").fetchone()
+    assert tuple(row) == (
+        "private-demo",
+        "1.0",
+        "# Changelog\n\n## 1.0\n\n- Initial release.\n",
+        "markdown",
+    )
 
 
 @pytest.mark.anyio

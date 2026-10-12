@@ -61,12 +61,16 @@ executing package code. Verified bytes are stored before the package is added
 to the catalog. Re-uploading identical bytes under the same filename is safe;
 different bytes require a new version and filename.
 
-## Package catalog links
+## Package changelogs
 
 The Wheelguard landing page links each private package to a
-small detail page with its latest version and any repository or changelog URLs
-published as standard Python project metadata. Add these entries to
-`pyproject.toml`:
+small detail page with its latest version. When a source distribution contains
+a top-level `CHANGELOG.md`, `CHANGES.md`, `HISTORY.md`, or equivalent RST/text
+file, Wheelguard stores a bounded snapshot for that exact version and renders
+it on the package page. Raw HTML in Markdown is escaped.
+
+Repository and source-file links may also be published as standard Python
+project metadata:
 
 ```toml
 [project.urls]
@@ -74,9 +78,11 @@ Repository = "https://gitlab.example.com/group/project"
 Changelog = "https://gitlab.example.com/group/project/-/blob/main/CHANGELOG.md"
 ```
 
-The next normal `uv publish` records the HTTPS links; no additional CI request
-or credential is needed. A missing changelog is shown as unavailable, and the
-detail page warns that opening a private GitLab link may require an account.
+The next normal `uv publish` captures included release notes and HTTPS links;
+no additional CI request or credential is needed. An administrator can backfill
+a reviewed changelog snapshot for an already-published version through the
+authenticated API. Missing changelogs are shown without an irrelevant GitLab
+permission warning.
 
 ## Public-name collisions
 

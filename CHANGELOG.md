@@ -12,6 +12,9 @@ All notable changes to Wheelguard are documented here.
   revocable repository tokens in the production runtime.
 - Proxy and verify PEP 658 metadata sidecars across the supported storage
   backends.
+- Embed bounded, version-specific changelogs from source distributions on
+  package detail pages, with safe Markdown rendering and an audited
+  administrator backfill path for existing releases.
 - Link private packages on the service landing page to detail pages that show
   the latest version plus repository and changelog links published through
   standard Python project metadata.
