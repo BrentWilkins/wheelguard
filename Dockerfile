@@ -10,6 +10,10 @@ COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable --extra azure
 
 FROM python:3.14-slim AS runtime
+# Apply Debian's zlib security update (CVE-2026-85091) even if the base image lags.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends --only-upgrade zlib1g \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 wheelguard \
     && mkdir --parents /data \
